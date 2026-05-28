@@ -11,7 +11,7 @@ const os = require('os');
 const path = require('path');
 const https = require('https');
 const zlib = require('zlib');
-const AdmZip = require('adm-zip');
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
@@ -91,46 +91,53 @@ function garantirYtdlp() {
   return prontoYtdlp;
 }
 
-// ---- Baixa o ffmpeg (ffbinaries 6.1 - baseado nos johnvansickle builds, vem em .zip) ----
+// ---- Baixa o ffmpeg (eugeneware/ffmpeg-static - .gz, descompacta com zlib nativo) ----
 const FFMPEG = path.join(os.tmpdir(), 'ffmpeg_bin');
-const FFMPEG_URL = 'https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v6.1/ffmpeg-6.1-linux-64.zip';
+const FFMPEG_URL = 'https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-linux-x64.gz';
 let prontoFfmpeg = null;
 function garantirFfmpeg() {
   if (prontoFfmpeg) return prontoFfmpeg;
   prontoFfmpeg = new Promise((resolve, reject) => {
     if (fs.existsSync(FFMPEG)) { try { fs.chmodSync(FFMPEG, 0o755); } catch (e) {} return resolve(); }
-    const zipPath = path.join(os.tmpdir(), 'ffmpeg.zip');
-    const extractDir = path.join(os.tmpdir(), 'ffmpeg-extract');
-
     const baixar = (url) => {
-      console.log('[cortador] baixando ffmpeg 6.1 (ffbinaries)...');
       https.get(url, (r) => {
         if (r.statusCode >= 300 && r.statusCode < 400 && r.headers.location) return baixar(r.headers.location);
         if (r.statusCode !== 200) return reject(new Error('Nao consegui baixar o ffmpeg (' + r.statusCode + ')'));
-        const out = fs.createWriteStream(zipPath);
-        r.pipe(out);
-        out.on('finish', () => {
-          out.close(() => {
-            console.log('[cortador] ffmpeg baixado, descompactando (adm-zip)...');
-            try {
-              const zip = new AdmZip(zipPath);
-              zip.extractAllTo(extractDir, true);
-              const ffmpegExtracted = path.join(extractDir, 'ffmpeg');
-              if (!fs.existsSync(ffmpegExtracted)) return reject(new Error('binary ffmpeg nao encontrado em ' + ffmpegExtracted));
-              fs.renameSync(ffmpegExtracted, FFMPEG);
-              fs.chmodSync(FFMPEG, 0o755);
-              try { fs.unlinkSync(zipPath); fs.rmSync(extractDir, { recursive: true, force: true }); } catch (e) {}
-              console.log('[cortador] ffmpeg 6.1 pronto em', FFMPEG);
-              resolve();
-            } catch (e) { reject(new Error('erro extraindo zip: ' + e.message)); }
-          });
-        });
+        const out = fs.createWriteStream(FFMPEG);
+        r.pipe(zlib.createGunzip()).pipe(out);
+        out.on('finish', () => out.close(() => { fs.chmodSync(FFMPEG, 0o755); console.log('[cortador] ffmpeg pronto'); resolve(); }));
         out.on('error', reject);
       }).on('error', reject);
     };
     baixar(FFMPEG_URL);
   });
   return prontoFfmpeg;
+}
+
+// ---- Cache de videos baixados (1 hora) ----
+const CACHE_DIR = path.join(os.tmpdir(), 'cortador-cache');
+const CACHE_TTL_MS = 60 * 60 * 1000;
+
+function cachePathPara(url) {
+  const hash = crypto.createHash('md5').update(url).digest('hex');
+  return path.join(CACHE_DIR, hash + '.mp4');
+}
+
+function limparCacheAntigo() {
+  try {
+    if (!fs.existsSync(CACHE_DIR)) return;
+    const agora = Date.now();
+    for (const f of fs.readdirSync(CACHE_DIR)) {
+      const fp = path.join(CACHE_DIR, f);
+      try {
+        const stat = fs.statSync(fp);
+        if (agora - stat.mtimeMs > CACHE_TTL_MS) {
+          fs.unlinkSync(fp);
+          console.log('[cortador] cache: removido', f, '(velho)');
+        }
+      } catch (e) {}
+    }
+  } catch (e) {}
 }
 
 function linkValido(u) {
@@ -146,7 +153,11 @@ function paraSegundos(t) {
 }
 
 app.get('/', (_req, res) => res.type('html').send(PAGINA));
-app.get('/status', (_req, res) => res.json({ ok: true, servico: 'cortador', versao: 19, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false }));
+app.get('/status', (_req, res) => {
+  let videosCacheados = 0;
+  try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
+  res.json({ ok: true, servico: 'cortador', versao: 20, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, videosNoCache: videosCacheados });
+});
 
 // Helper: roda um comando e retorna {codigo, stdout, stderr}
 function executar(cmd, args, label) {
@@ -184,54 +195,60 @@ app.post('/cortar', async (req, res) => {
   try {
     await garantirYtdlp();
     await garantirFfmpeg();
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    limparCacheAntigo();
     pasta = fs.mkdtempSync(path.join(os.tmpdir(), 'corte-'));
+    const fullPath = cachePathPara(url);
     const cortePath = path.join(pasta, 'corte.mp4');
     const duracao = sf - si;
+    const cacheHit = fs.existsSync(fullPath);
 
-    // ETAPA 1: pegar URLs diretas dos streams (sem baixar nada)
-    const t1 = Date.now();
-    console.log('[cortador] etapa 1: pegando URLs dos streams | url', url, '| proxy:', PROXY_URL ? 'sim' : 'nao');
-    const r1 = await executar(YTDLP, [
-      '--no-playlist', '--no-warnings', '--no-progress',
-      '--extractor-args', 'youtube:player_client=tv,web_safari,default',
-      ...(cookiesOk ? ['--cookies', COOKIES_PATH] : []),
-      ...(PROXY_URL ? ['--proxy', PROXY_URL] : []),
-      '-f', 'bv*[vcodec^=avc1][height<=720][fps<=30]+ba[ext=m4a]/bv*[vcodec^=avc1][height<=720]+ba[ext=m4a]/b[ext=mp4][height<=720]/b[ext=mp4]/b',
-      '-g',
-      url,
-    ], 'yt-dlp-get-url');
-    const dt1 = ((Date.now() - t1) / 1000).toFixed(1);
-    console.log('[cortador] etapa 1 levou', dt1, 's');
+    // ETAPA 1: baixar vídeo inteiro (PULA SE JÁ TEM NO CACHE)
+    if (cacheHit) {
+      console.log('[cortador] CACHE HIT - usando video ja baixado:', path.basename(fullPath));
+    } else {
+      const t1 = Date.now();
+      console.log('[cortador] CACHE MISS - baixando video completo | url', url, '| proxy:', PROXY_URL ? 'sim' : 'nao');
+      const r1 = await executar(YTDLP, [
+        '--no-playlist', '--no-warnings', '--no-progress',
+        '--extractor-args', 'youtube:player_client=tv,web_safari,default',
+        ...(cookiesOk ? ['--cookies', COOKIES_PATH] : []),
+        ...(PROXY_URL ? ['--proxy', PROXY_URL] : []),
+        '--ffmpeg-location', FFMPEG,
+        '-N', '4',
+        '-f', 'bv*[vcodec^=avc1][height<=720][fps<=30]+ba[ext=m4a]/bv*[vcodec^=avc1][height<=720]+ba[ext=m4a]/b[ext=mp4][height<=720]/b[ext=mp4]/b',
+        '--merge-output-format', 'mp4',
+        '-o', fullPath,
+        url,
+      ], 'yt-dlp-download');
+      const dt1 = ((Date.now() - t1) / 1000).toFixed(1);
+      console.log('[cortador] download levou', dt1, 's');
 
-    if (r1.codigo !== 0) {
-      limpar(pasta);
-      return res.status(500).json({ erro: 'Nao consegui acessar esse video. Confere o link.', detalhe: (r1.stderr || 'sem detalhes').slice(-600) });
+      if (r1.codigo !== 0 || !fs.existsSync(fullPath)) {
+        try { if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath); } catch (e) {}
+        limpar(pasta);
+        return res.status(500).json({ erro: 'Nao consegui baixar esse video. Confere o link.', detalhe: (r1.stderr || r1.stdout || 'sem detalhes').slice(-600) });
+      }
     }
 
-    const urlsStreams = r1.stdout.trim().split('\n').map(l => l.trim()).filter(l => l.startsWith('http'));
-    if (urlsStreams.length === 0) {
-      limpar(pasta);
-      return res.status(500).json({ erro: 'Nao consegui pegar a URL do stream.', detalhe: (r1.stderr || r1.stdout || 'sem detalhes').slice(-600) });
-    }
-    console.log('[cortador] consegui', urlsStreams.length, 'URL(s) de stream');
-
-    // ETAPA 2: ffmpeg faz seek + Range request - baixa SO os bytes do trecho
+    // ETAPA 2: cortar localmente
     const t2 = Date.now();
-    console.log('[cortador] etapa 2: ffmpeg cortando direto do stream | inicio', si, 's | duracao', duracao, 's');
-    const ffmpegArgs = ['-y'];
-    const proxyOpts = PROXY_URL ? ['-http_proxy', PROXY_URL] : [];
-    for (const u of urlsStreams) {
-      ffmpegArgs.push(...proxyOpts, '-ss', String(si), '-i', u);
-    }
-    ffmpegArgs.push('-t', String(duracao), '-c', 'copy', '-avoid_negative_ts', 'make_zero', cortePath);
-
-    const r2 = await executar(FFMPEG, ffmpegArgs, 'ffmpeg-stream-cut');
+    console.log('[cortador] cortando | inicio', si, 's | duracao', duracao, 's');
+    const r2 = await executar(FFMPEG, [
+      '-y',
+      '-ss', String(si),
+      '-i', fullPath,
+      '-t', String(duracao),
+      '-c', 'copy',
+      '-avoid_negative_ts', 'make_zero',
+      cortePath,
+    ], 'ffmpeg-cut');
     const dt2 = ((Date.now() - t2) / 1000).toFixed(1);
-    console.log('[cortador] etapa 2 levou', dt2, 's | total:', (parseFloat(dt1) + parseFloat(dt2)).toFixed(1), 's');
+    console.log('[cortador] cut levou', dt2, 's | cache:', cacheHit ? 'HIT' : 'MISS');
 
     if (r2.codigo !== 0 || !fs.existsSync(cortePath)) {
       limpar(pasta);
-      return res.status(500).json({ erro: 'Nao consegui cortar esse trecho.', detalhe: `codigo=${r2.codigo} | ${(r2.stderr || r2.stdout || 'sem detalhes').slice(-600)}` });
+      return res.status(500).json({ erro: 'Baixei o video mas nao consegui cortar.', detalhe: (r2.stderr || 'sem detalhes').slice(-600) });
     }
 
     res.download(cortePath, `corte_${inicio.replace(/:/g, '-')}_a_${fim.replace(/:/g, '-')}.mp4`, () => limpar(pasta));
