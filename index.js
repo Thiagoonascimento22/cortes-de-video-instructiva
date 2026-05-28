@@ -91,21 +91,37 @@ function garantirYtdlp() {
   return prontoYtdlp;
 }
 
-// ---- Baixa o ffmpeg (eugeneware/ffmpeg-static - .gz, descompacta com zlib nativo) ----
-const FFMPEG = path.join(os.tmpdir(), 'ffmpeg_bin');
+// ---- ffmpeg: prefere o do sistema (nixpacks apt) - mais compativel que binario static ----
+let FFMPEG = path.join(os.tmpdir(), 'ffmpeg_bin');
 const FFMPEG_URL = 'https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-linux-x64.gz';
 let prontoFfmpeg = null;
 function garantirFfmpeg() {
   if (prontoFfmpeg) return prontoFfmpeg;
   prontoFfmpeg = new Promise((resolve, reject) => {
-    if (fs.existsSync(FFMPEG)) { try { fs.chmodSync(FFMPEG, 0o755); } catch (e) {} return resolve(); }
+    // 1. Tentar ffmpeg do sistema (instalado via apt no nixpacks)
+    const tentativasSistema = ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg'];
+    for (const caminho of tentativasSistema) {
+      if (fs.existsSync(caminho)) {
+        FFMPEG = caminho;
+        console.log('[cortador] usando ffmpeg do sistema:', caminho);
+        return resolve();
+      }
+    }
+    // 2. Cache - se ja baixou antes, usa
+    if (fs.existsSync(FFMPEG)) {
+      try { fs.chmodSync(FFMPEG, 0o755); } catch (e) {}
+      console.log('[cortador] usando ffmpeg cacheado:', FFMPEG);
+      return resolve();
+    }
+    // 3. Fallback: baixar binario static (ultimo recurso, tem problemas)
+    console.log('[cortador] ffmpeg do sistema nao encontrado, baixando binario static...');
     const baixar = (url) => {
       https.get(url, (r) => {
         if (r.statusCode >= 300 && r.statusCode < 400 && r.headers.location) return baixar(r.headers.location);
         if (r.statusCode !== 200) return reject(new Error('Nao consegui baixar o ffmpeg (' + r.statusCode + ')'));
         const out = fs.createWriteStream(FFMPEG);
         r.pipe(zlib.createGunzip()).pipe(out);
-        out.on('finish', () => out.close(() => { fs.chmodSync(FFMPEG, 0o755); console.log('[cortador] ffmpeg pronto'); resolve(); }));
+        out.on('finish', () => out.close(() => { fs.chmodSync(FFMPEG, 0o755); console.log('[cortador] ffmpeg static baixado'); resolve(); }));
         out.on('error', reject);
       }).on('error', reject);
     };
@@ -332,7 +348,7 @@ app.get('/', (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 26, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 27, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, ffmpeg: FFMPEG, videosNoCache: videosCacheados });
 });
 
 // Helper: roda um comando e retorna {codigo, sinal, stdout, stderr}
