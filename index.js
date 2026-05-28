@@ -26,9 +26,27 @@ let cookiesOk = false;
 function prepararCookies() {
   const raw = process.env.YOUTUBE_COOKIES;
   if (!raw || !raw.trim()) { cookiesOk = false; return; }
-  let conteudo = raw.replace(/\r\n/g, '\n');
+  let conteudo = raw.replace(/\r\n/g, '\n').trim();
+
+  // Detecta se veio em base64 (uma linha so, sem tabs) e decodifica
+  if (!conteudo.includes('\t') && !conteudo.startsWith('# Netscape') && /^[A-Za-z0-9+/=\s]+$/.test(conteudo)) {
+    try {
+      const decoded = Buffer.from(conteudo.replace(/\s+/g, ''), 'base64').toString('utf8');
+      if (decoded.includes('\t') || decoded.startsWith('# Netscape')) {
+        conteudo = decoded;
+        console.log('[cortador] cookies vieram em base64, decodificados');
+      }
+    } catch (e) {}
+  }
+
   if (!conteudo.startsWith('# Netscape')) conteudo = '# Netscape HTTP Cookie File\n' + conteudo;
-  try { fs.writeFileSync(COOKIES_PATH, conteudo); cookiesOk = true; } catch (e) { cookiesOk = false; }
+  try {
+    fs.writeFileSync(COOKIES_PATH, conteudo);
+    cookiesOk = true;
+    const linhas = conteudo.split('\n').filter(l => l && !l.startsWith('#'));
+    const comTabs = linhas.filter(l => l.includes('\t')).length;
+    console.log(`[cortador] cookies: ${linhas.length} linhas, ${comTabs} com tabs`);
+  } catch (e) { cookiesOk = false; }
 }
 prepararCookies();
 console.log('[cortador] cookies:', cookiesOk ? 'carregados' : 'ausentes');
@@ -91,7 +109,7 @@ function paraSegundos(t) {
 }
 
 app.get('/', (_req, res) => res.type('html').send(PAGINA));
-app.get('/status', (_req, res) => res.json({ ok: true, servico: 'cortador', versao: 8, cookies: cookiesOk }));
+app.get('/status', (_req, res) => res.json({ ok: true, servico: 'cortador', versao: 9, cookies: cookiesOk }));
 
 app.post('/cortar', async (req, res) => {
   const url = (req.body.url || '').trim();
