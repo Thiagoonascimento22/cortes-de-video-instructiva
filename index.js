@@ -118,9 +118,9 @@ function garantirFfmpeg() {
 const CACHE_DIR = path.join(os.tmpdir(), 'cortador-cache');
 const CACHE_TTL_MS = 60 * 60 * 1000;
 
-function cachePathPara(url) {
+function cachePathPara(url, ext) {
   const hash = crypto.createHash('md5').update(url).digest('hex');
-  return path.join(CACHE_DIR, hash + '.mp4');
+  return path.join(CACHE_DIR, hash + '.' + (ext || 'mp4'));
 }
 
 function limparCacheAntigo() {
@@ -168,7 +168,7 @@ app.get('/', (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 21, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 22, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, videosNoCache: videosCacheados });
 });
 
 // Helper: roda um comando e retorna {codigo, stdout, stderr}
@@ -213,7 +213,8 @@ app.post('/cortar', async (req, res) => {
     fs.mkdirSync(CACHE_DIR, { recursive: true });
     limparCacheAntigo();
     pasta = fs.mkdtempSync(path.join(os.tmpdir(), 'corte-'));
-    const fullPath = cachePathPara(url);
+    const ext = tipoUrl === 'hls' ? 'ts' : 'mp4';
+    const fullPath = cachePathPara(url, ext);
     const cortePath = path.join(pasta, 'corte.mp4');
     const duracao = sf - si;
     const cacheHit = fs.existsSync(fullPath);
@@ -241,13 +242,14 @@ app.post('/cortar', async (req, res) => {
       } else if (tipoUrl === 'hls') {
         const origem = origemDaUrl(url);
         console.log('[cortador] CACHE MISS - baixando HLS do Panda | origem:', origem);
+        // --hls-use-mpegts evita o postprocessing/mux pra mp4 (que crasha o ffmpeg-static)
+        // Salva direto como .ts - ffmpeg local depois corta pra .mp4 sem problemas
         args = [
           '--no-warnings', '--no-progress',
-          '--ffmpeg-location', FFMPEG,
           '-N', '4',
           ...(origem ? ['--add-header', `Origin:${origem}`, '--add-header', `Referer:${origem}/`] : []),
           '--hls-prefer-native',
-          '--merge-output-format', 'mp4',
+          '--hls-use-mpegts',
           '-o', fullPath,
           url,
         ];
