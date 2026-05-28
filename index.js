@@ -168,7 +168,7 @@ app.get('/', (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 24, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 25, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, videosNoCache: videosCacheados });
 });
 
 // Helper: roda um comando e retorna {codigo, sinal, stdout, stderr}
@@ -213,20 +213,27 @@ app.post('/cortar', async (req, res) => {
     fs.mkdirSync(CACHE_DIR, { recursive: true });
     limparCacheAntigo();
     pasta = fs.mkdtempSync(path.join(os.tmpdir(), 'corte-'));
-    const ext = tipoUrl === 'hls' ? 'ts' : 'mp4';
-    const fullPath = cachePathPara(url, ext);
+    const fullPath = cachePathPara(url, 'mp4');
     const cortePath = path.join(pasta, 'corte.mp4');
     const duracao = sf - si;
-    const cacheHit = fs.existsSync(fullPath);
+    // Cache vale se arquivo existe E tem >= 1MB (arquivos menores sao corrompidos)
+    let cacheHit = false;
+    if (fs.existsSync(fullPath)) {
+      try {
+        if (fs.statSync(fullPath).size > 1024 * 1024) cacheHit = true;
+        else { fs.unlinkSync(fullPath); console.log('[cortador] cache invalido (< 1MB), removendo'); }
+      } catch (e) {}
+    }
 
-    // ETAPA 1: baixar vídeo inteiro (PULA SE JÁ TEM NO CACHE)
+    // ETAPA 1: baixar vídeo inteiro (PULA SE JÁ TEM NO CACHE VALIDO)
     if (cacheHit) {
       console.log('[cortador] CACHE HIT - usando video ja baixado:', path.basename(fullPath));
     } else {
       const t1 = Date.now();
-      let args;
+      let comando, args;
       if (tipoUrl === 'youtube') {
-        console.log('[cortador] CACHE MISS - baixando do YouTube | proxy:', PROXY_URL ? 'sim' : 'nao');
+        console.log('[cortador] CACHE MISS - baixando do YouTube via yt-dlp | proxy:', PROXY_URL ? 'sim' : 'nao');
+        comando = YTDLP;
         args = [
           '--no-playlist', '--no-warnings', '--no-progress',
           '--extractor-args', 'youtube:player_client=tv,web_safari,default',
@@ -241,67 +248,52 @@ app.post('/cortar', async (req, res) => {
         ];
       } else if (tipoUrl === 'hls') {
         const origem = origemDaUrl(url);
-        console.log('[cortador] CACHE MISS - baixando HLS do Panda | origem:', origem);
-        // --hls-use-mpegts evita o postprocessing/mux pra mp4 (que crasha o ffmpeg-static)
-        // Salva direto como .ts - ffmpeg local depois corta pra .mp4 sem problemas
+        console.log('[cortador] CACHE MISS - baixando HLS direto com ffmpeg | origem:', origem);
+        // ffmpeg suporta HLS nativamente - mais robusto que yt-dlp pra Panda
+        comando = FFMPEG;
         args = [
-          '--no-warnings', '--no-progress',
-          '-N', '4',
-          ...(origem ? ['--add-header', `Origin:${origem}`, '--add-header', `Referer:${origem}/`] : []),
-          '--hls-prefer-native',
-          '--hls-use-mpegts',
-          '-o', fullPath,
-          url,
+          '-y',
+          '-loglevel', 'warning',
+          ...(origem ? ['-headers', `Origin: ${origem}\r\nReferer: ${origem}/\r\n`] : []),
+          '-i', url,
+          '-c', 'copy',
+          '-bsf:a', 'aac_adtstoasc',
+          '-movflags', '+faststart',
+          fullPath,
         ];
       } else {
         limpar(pasta);
         return res.status(400).json({ erro: 'Tipo de URL nao suportado.' });
       }
 
-      const r1 = await executar(YTDLP, args, 'yt-dlp-download');
+      const r1 = await executar(comando, args, tipoUrl + '-download');
       const dt1 = ((Date.now() - t1) / 1000).toFixed(1);
-      console.log('[cortador] download levou', dt1, 's');
+      let baixadoMB = '?';
+      try { if (fs.existsSync(fullPath)) baixadoMB = (fs.statSync(fullPath).size / 1024 / 1024).toFixed(1); } catch (e) {}
+      console.log('[cortador] download levou', dt1, 's | arquivo:', baixadoMB, 'MB');
 
-      if (r1.codigo !== 0 || !fs.existsSync(fullPath)) {
+      if (r1.codigo !== 0 || !fs.existsSync(fullPath) || fs.statSync(fullPath).size < 1024 * 1024) {
         try { if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath); } catch (e) {}
         limpar(pasta);
-        return res.status(500).json({ erro: 'Nao consegui baixar esse video. Confere o link.', detalhe: (r1.stderr || r1.stdout || 'sem detalhes').slice(-600) });
+        return res.status(500).json({ erro: 'Nao consegui baixar esse video. Confere o link.', detalhe: `codigo=${r1.codigo} sinal=${r1.sinal} baixou=${baixadoMB}MB | ${(r1.stderr || r1.stdout || 'sem detalhes').slice(-1500)}` });
       }
     }
 
-    // ETAPA 2: cortar localmente
+    // ETAPA 2: cortar localmente (input agora eh sempre .mp4 - pra YouTube e HLS)
     const t2 = Date.now();
     let tamanhoMB = '?';
     try { tamanhoMB = (fs.statSync(fullPath).size / 1024 / 1024).toFixed(1); } catch (e) {}
-    console.log('[cortador] cortando | inicio', si, 's | duracao', duracao, 's | input', path.basename(fullPath), tamanhoMB, 'MB');
+    console.log('[cortador] cortando | inicio', si, 's | duracao', duracao, 's | input', tamanhoMB, 'MB');
 
-    // Args do ffmpeg cut diferem por tipo:
-    // - mp4 (YouTube): -ss antes de -i (fast seek via index)
-    // - ts (HLS): -ss depois de -i (slow seek mas leve em memoria, sem precisar carregar index)
-    let cutArgs;
-    if (tipoUrl === 'hls') {
-      cutArgs = [
-        '-y',
-        '-threads', '1',
-        '-i', fullPath,
-        '-ss', String(si),
-        '-t', String(duracao),
-        '-c', 'copy',
-        '-bsf:a', 'aac_adtstoasc',
-        cortePath,
-      ];
-    } else {
-      cutArgs = [
-        '-y',
-        '-ss', String(si),
-        '-i', fullPath,
-        '-t', String(duracao),
-        '-c', 'copy',
-        '-avoid_negative_ts', 'make_zero',
-        cortePath,
-      ];
-    }
-    const r2 = await executar(FFMPEG, cutArgs, 'ffmpeg-cut');
+    const r2 = await executar(FFMPEG, [
+      '-y',
+      '-ss', String(si),
+      '-i', fullPath,
+      '-t', String(duracao),
+      '-c', 'copy',
+      '-avoid_negative_ts', 'make_zero',
+      cortePath,
+    ], 'ffmpeg-cut');
     const dt2 = ((Date.now() - t2) / 1000).toFixed(1);
     console.log('[cortador] cut levou', dt2, 's | cache:', cacheHit ? 'HIT' : 'MISS');
 
