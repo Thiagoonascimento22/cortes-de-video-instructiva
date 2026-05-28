@@ -168,7 +168,7 @@ app.get('/', (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 22, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 23, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, videosNoCache: videosCacheados });
 });
 
 // Helper: roda um comando e retorna {codigo, stdout, stderr}
@@ -271,13 +271,15 @@ app.post('/cortar', async (req, res) => {
 
     // ETAPA 2: cortar localmente
     const t2 = Date.now();
-    console.log('[cortador] cortando | inicio', si, 's | duracao', duracao, 's');
+    console.log('[cortador] cortando | inicio', si, 's | duracao', duracao, 's | input', path.basename(fullPath));
     const r2 = await executar(FFMPEG, [
       '-y',
+      '-fflags', '+genpts+igndts',
       '-ss', String(si),
       '-i', fullPath,
       '-t', String(duracao),
       '-c', 'copy',
+      '-bsf:a', 'aac_adtstoasc',
       '-avoid_negative_ts', 'make_zero',
       cortePath,
     ], 'ffmpeg-cut');
@@ -286,7 +288,7 @@ app.post('/cortar', async (req, res) => {
 
     if (r2.codigo !== 0 || !fs.existsSync(cortePath)) {
       limpar(pasta);
-      return res.status(500).json({ erro: 'Baixei o video mas nao consegui cortar.', detalhe: (r2.stderr || 'sem detalhes').slice(-600) });
+      return res.status(500).json({ erro: 'Baixei o video mas nao consegui cortar.', detalhe: `codigo=${r2.codigo} | ${(r2.stderr || 'sem detalhes').slice(-1500)}` });
     }
 
     res.download(cortePath, `corte_${inicio.replace(/:/g, '-')}_a_${fim.replace(/:/g, '-')}.mp4`, () => limpar(pasta));
