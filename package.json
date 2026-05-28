@@ -1,0 +1,11 @@
+{
+  "name": "cortador",
+  "version": "1.0.0",
+  "description": "Corta um trecho de um video do YouTube",
+  "main": "index.js",
+  "scripts": { "start": "node index.js" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5"
+  }
+}
