@@ -126,7 +126,26 @@ function paraSegundos(t) {
 }
 
 app.get('/', (_req, res) => res.type('html').send(PAGINA));
-app.get('/status', (_req, res) => res.json({ ok: true, servico: 'cortador', versao: 13, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false }));
+app.get('/status', (_req, res) => res.json({ ok: true, servico: 'cortador', versao: 14, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false }));
+
+// Helper: roda um comando e retorna {codigo, saida}
+function executar(cmd, args, label) {
+  return new Promise((resolve) => {
+    console.log('[cortador]', label, 'iniciando...');
+    const proc = spawn(cmd, args);
+    let saida = '';
+    proc.stderr.on('data', d => { saida += d.toString(); });
+    proc.stdout.on('data', d => { saida += d.toString(); });
+    proc.on('close', (codigo) => {
+      console.log('[cortador]', label, 'terminou com codigo', codigo);
+      if (saida) console.log('[cortador] saida de', label + ':\n' + saida.slice(-1500));
+      resolve({ codigo, saida });
+    });
+    proc.on('error', (err) => {
+      resolve({ codigo: -1, saida: 'erro ao executar: ' + err.message });
+    });
+  });
+}
 
 app.post('/cortar', async (req, res) => {
   const url = (req.body.url || '').trim();
@@ -145,38 +164,47 @@ app.post('/cortar', async (req, res) => {
     await garantirYtdlp();
     await garantirFfmpeg();
     pasta = fs.mkdtempSync(path.join(os.tmpdir(), 'corte-'));
-    const secao = `*${inicio}-${fim}`;
-    const args = [
+    const fullPath = path.join(pasta, 'full.mp4');
+    const cortePath = path.join(pasta, 'corte.mp4');
+
+    // ETAPA 1: baixar vídeo inteiro (sem cortar, sem download-sections)
+    console.log('[cortador] etapa 1: baixando video completo | url', url, '| proxy:', PROXY_URL ? 'sim' : 'nao');
+    const r1 = await executar(YTDLP, [
       '--no-playlist', '--no-warnings', '--no-progress',
       '--extractor-args', 'youtube:player_client=tv,web_safari,default',
       ...(cookiesOk ? ['--cookies', COOKIES_PATH] : []),
       ...(PROXY_URL ? ['--proxy', PROXY_URL] : []),
       '--ffmpeg-location', FFMPEG,
       '-f', 'bv*[vcodec^=avc1][height<=720][fps<=30]+ba[ext=m4a]/bv*[vcodec^=avc1][height<=720]+ba[ext=m4a]/b[ext=mp4][height<=720]/b[ext=mp4]/b',
-      '--download-sections', secao,
       '--merge-output-format', 'mp4',
-      '-o', path.join(pasta, 'corte.%(ext)s'),
+      '-o', fullPath,
       url,
-    ];
+    ], 'yt-dlp-download');
 
-    console.log('[cortador] rodando yt-dlp | trecho', secao, '| url', url, '| proxy:', PROXY_URL ? 'sim' : 'nao');
-    const proc = spawn(YTDLP, args);
-    let erroSaida = '';
-    proc.stderr.on('data', d => { erroSaida += d.toString(); });
-    proc.stdout.on('data', d => { erroSaida += d.toString(); });
+    if (r1.codigo !== 0 || !fs.existsSync(fullPath)) {
+      limpar(pasta);
+      return res.status(500).json({ erro: 'Nao consegui baixar esse video. Confere o link.', detalhe: (r1.saida || 'sem detalhes').slice(-600) });
+    }
 
-    proc.on('close', (codigo) => {
-      console.log('[cortador] yt-dlp terminou com codigo', codigo);
-      if (erroSaida) console.log('[cortador] saida do yt-dlp:\n' + erroSaida.slice(-1500));
-      if (codigo !== 0) {
-        limpar(pasta);
-        return res.status(500).json({ erro: 'Nao rolou baixar esse trecho. Confere o link e os tempos.', detalhe: (erroSaida || 'sem detalhes').slice(-600) });
-      }
-      const arquivos = fs.readdirSync(pasta).filter(f => f.startsWith('corte'));
-      if (!arquivos.length) { limpar(pasta); return res.status(500).json({ erro: 'O corte nao foi gerado. Tenta de novo.' }); }
-      const caminho = path.join(pasta, arquivos[0]);
-      res.download(caminho, `corte_${inicio.replace(/:/g, '-')}_a_${fim.replace(/:/g, '-')}.mp4`, () => limpar(pasta));
-    });
+    // ETAPA 2: cortar localmente (input arquivo local, sem rede)
+    const duracao = sf - si;
+    console.log('[cortador] etapa 2: cortando | inicio', si, 's | duracao', duracao, 's');
+    const r2 = await executar(FFMPEG, [
+      '-y',
+      '-ss', String(si),
+      '-i', fullPath,
+      '-t', String(duracao),
+      '-c', 'copy',
+      '-avoid_negative_ts', 'make_zero',
+      cortePath,
+    ], 'ffmpeg-cut');
+
+    if (r2.codigo !== 0 || !fs.existsSync(cortePath)) {
+      limpar(pasta);
+      return res.status(500).json({ erro: 'Baixei o video mas nao consegui cortar.', detalhe: (r2.saida || 'sem detalhes').slice(-600) });
+    }
+
+    res.download(cortePath, `corte_${inicio.replace(/:/g, '-')}_a_${fim.replace(/:/g, '-')}.mp4`, () => limpar(pasta));
   } catch (e) {
     if (pasta) limpar(pasta);
     res.status(500).json({ erro: 'Deu um erro no servidor.', detalhe: String(e.message || e) });
