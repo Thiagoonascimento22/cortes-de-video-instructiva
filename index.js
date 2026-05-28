@@ -90,47 +90,44 @@ function garantirYtdlp() {
   return prontoYtdlp;
 }
 
-// ---- Baixa o ffmpeg (BtbN build completo - tar.xz, extraido com tar -xJ) ----
+// ---- Baixa o ffmpeg (ffbinaries 6.1 - baseado nos johnvansickle builds, vem em .zip) ----
 const FFMPEG = path.join(os.tmpdir(), 'ffmpeg_bin');
-const FFMPEG_URL = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz';
+const FFMPEG_URL = 'https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v6.1/ffmpeg-6.1-linux-64.zip';
 let prontoFfmpeg = null;
 function garantirFfmpeg() {
   if (prontoFfmpeg) return prontoFfmpeg;
   prontoFfmpeg = new Promise((resolve, reject) => {
     if (fs.existsSync(FFMPEG)) { try { fs.chmodSync(FFMPEG, 0o755); } catch (e) {} return resolve(); }
-    const tarPath = path.join(os.tmpdir(), 'ffmpeg.tar.xz');
+    const zipPath = path.join(os.tmpdir(), 'ffmpeg.zip');
     const extractDir = path.join(os.tmpdir(), 'ffmpeg-extract');
 
     const baixar = (url) => {
-      console.log('[cortador] baixando ffmpeg BtbN...');
+      console.log('[cortador] baixando ffmpeg 6.1 (ffbinaries)...');
       https.get(url, (r) => {
         if (r.statusCode >= 300 && r.statusCode < 400 && r.headers.location) return baixar(r.headers.location);
         if (r.statusCode !== 200) return reject(new Error('Nao consegui baixar o ffmpeg (' + r.statusCode + ')'));
-        const out = fs.createWriteStream(tarPath);
+        const out = fs.createWriteStream(zipPath);
         r.pipe(out);
         out.on('finish', () => {
           out.close(() => {
-            console.log('[cortador] ffmpeg baixado, extraindo...');
+            console.log('[cortador] ffmpeg baixado, descompactando...');
             try { fs.mkdirSync(extractDir, { recursive: true }); } catch (e) {}
-            const proc = spawn('tar', ['-xJf', tarPath, '-C', extractDir]);
-            let tarErr = '';
-            proc.stderr.on('data', d => { tarErr += d.toString(); });
+            const proc = spawn('unzip', ['-o', zipPath, '-d', extractDir]);
+            let unzipErr = '';
+            proc.stderr.on('data', d => { unzipErr += d.toString(); });
             proc.on('close', (code) => {
-              if (code !== 0) return reject(new Error('tar falhou (' + code + '): ' + tarErr));
+              if (code !== 0) return reject(new Error('unzip falhou (' + code + '): ' + unzipErr));
               try {
-                const dirs = fs.readdirSync(extractDir);
-                const ffmpegDir = dirs.find(d => d.includes('ffmpeg'));
-                if (!ffmpegDir) return reject(new Error('diretorio ffmpeg nao encontrado'));
-                const ffmpegExtracted = path.join(extractDir, ffmpegDir, 'bin', 'ffmpeg');
+                const ffmpegExtracted = path.join(extractDir, 'ffmpeg');
                 if (!fs.existsSync(ffmpegExtracted)) return reject(new Error('binary ffmpeg nao encontrado em ' + ffmpegExtracted));
                 fs.renameSync(ffmpegExtracted, FFMPEG);
                 fs.chmodSync(FFMPEG, 0o755);
-                try { fs.unlinkSync(tarPath); fs.rmSync(extractDir, { recursive: true, force: true }); } catch (e) {}
-                console.log('[cortador] ffmpeg BtbN pronto em', FFMPEG);
+                try { fs.unlinkSync(zipPath); fs.rmSync(extractDir, { recursive: true, force: true }); } catch (e) {}
+                console.log('[cortador] ffmpeg 6.1 pronto em', FFMPEG);
                 resolve();
               } catch (e) { reject(e); }
             });
-            proc.on('error', (err) => reject(new Error('spawn tar erro: ' + err.message)));
+            proc.on('error', (err) => reject(new Error('spawn unzip erro: ' + err.message)));
           });
         });
         out.on('error', reject);
@@ -154,7 +151,7 @@ function paraSegundos(t) {
 }
 
 app.get('/', (_req, res) => res.type('html').send(PAGINA));
-app.get('/status', (_req, res) => res.json({ ok: true, servico: 'cortador', versao: 17, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false }));
+app.get('/status', (_req, res) => res.json({ ok: true, servico: 'cortador', versao: 18, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false }));
 
 // Helper: roda um comando e retorna {codigo, stdout, stderr}
 function executar(cmd, args, label) {
