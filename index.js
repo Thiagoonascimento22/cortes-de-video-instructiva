@@ -155,6 +155,170 @@ function detectarTipoUrl(u) {
 function origemDaUrl(u) {
   try { return new URL(u).origin; } catch (e) { return null; }
 }
+// ---- Helpers de download HTTP nativo do Node (sem ffmpeg) ----
+function baixarTexto(url, headers) {
+  return new Promise((resolve, reject) => {
+    const tentar = (u, redirectsRestantes = 5) => {
+      const opts = { headers: headers || {} };
+      https.get(u, opts, (r) => {
+        if (r.statusCode >= 300 && r.statusCode < 400 && r.headers.location && redirectsRestantes > 0) {
+          return tentar(new URL(r.headers.location, u).toString(), redirectsRestantes - 1);
+        }
+        if (r.statusCode !== 200) return reject(new Error('HTTP ' + r.statusCode + ' em ' + u));
+        let data = '';
+        r.setEncoding('utf8');
+        r.on('data', chunk => { data += chunk; });
+        r.on('end', () => resolve(data));
+      }).on('error', reject);
+    };
+    tentar(url);
+  });
+}
+
+function baixarBinario(url, headers, destinoArquivo) {
+  return new Promise((resolve, reject) => {
+    const tentar = (u, redirectsRestantes = 5) => {
+      const opts = { headers: headers || {} };
+      https.get(u, opts, (r) => {
+        if (r.statusCode >= 300 && r.statusCode < 400 && r.headers.location && redirectsRestantes > 0) {
+          return tentar(new URL(r.headers.location, u).toString(), redirectsRestantes - 1);
+        }
+        if (r.statusCode !== 200) return reject(new Error('HTTP ' + r.statusCode + ' em ' + u));
+        const out = fs.createWriteStream(destinoArquivo);
+        r.pipe(out);
+        out.on('finish', () => out.close(() => resolve()));
+        out.on('error', reject);
+      }).on('error', reject);
+    };
+    tentar(url);
+  });
+}
+
+function parseM3u8(texto) {
+  const linhas = texto.split('\n').map(l => l.trim()).filter(l => l);
+  const ehMaster = texto.includes('#EXT-X-STREAM-INF:');
+  const itens = [];
+  if (ehMaster) {
+    let info = null;
+    for (const linha of linhas) {
+      if (linha.startsWith('#EXT-X-STREAM-INF:')) {
+        const bw = linha.match(/BANDWIDTH=(\d+)/);
+        const res = linha.match(/RESOLUTION=(\d+)x(\d+)/);
+        info = { bandwidth: bw ? parseInt(bw[1]) : 0, altura: res ? parseInt(res[2]) : 0 };
+      } else if (!linha.startsWith('#') && info) {
+        itens.push({ ...info, url: linha });
+        info = null;
+      }
+    }
+  } else {
+    for (const linha of linhas) {
+      if (!linha.startsWith('#') && linha) itens.push({ url: linha });
+    }
+  }
+  return { ehMaster, itens };
+}
+
+async function baixarSegmentosParalelo(urlsAbsolutas, headers, pastaTemp, paralelos = 4) {
+  const arquivos = new Array(urlsAbsolutas.length);
+  let proximo = 0;
+  async function worker() {
+    while (true) {
+      const idx = proximo++;
+      if (idx >= urlsAbsolutas.length) break;
+      const dest = path.join(pastaTemp, `seg_${String(idx).padStart(5, '0')}.ts`);
+      let tentativas = 0;
+      while (tentativas < 3) {
+        try {
+          await baixarBinario(urlsAbsolutas[idx], headers, dest);
+          arquivos[idx] = dest;
+          break;
+        } catch (e) {
+          tentativas++;
+          if (tentativas >= 3) throw new Error(`Segmento ${idx} falhou: ${e.message}`);
+          await new Promise(r => setTimeout(r, 500 * tentativas));
+        }
+      }
+    }
+  }
+  const workers = Array.from({ length: paralelos }, () => worker());
+  await Promise.all(workers);
+  return arquivos;
+}
+
+function concatenarArquivos(arquivos, destino) {
+  return new Promise((resolve, reject) => {
+    const out = fs.createWriteStream(destino);
+    let i = 0;
+    function proximo() {
+      if (i >= arquivos.length) { out.end(); return; }
+      const inp = fs.createReadStream(arquivos[i++]);
+      inp.pipe(out, { end: false });
+      inp.on('end', proximo);
+      inp.on('error', reject);
+    }
+    out.on('finish', resolve);
+    out.on('error', reject);
+    proximo();
+  });
+}
+
+async function baixarHLSCompleto(urlM3u8, destinoMp4) {
+  const origem = origemDaUrl(urlM3u8);
+  const headers = origem ? { 'Origin': origem, 'Referer': origem + '/' } : {};
+
+  // 1. Baixar master playlist
+  console.log('[cortador-hls] 1/5 - baixando master playlist');
+  const masterTxt = await baixarTexto(urlM3u8, headers);
+  const master = parseM3u8(masterTxt);
+  console.log('[cortador-hls] master:', master.ehMaster ? `${master.itens.length} variants` : 'ja eh playlist de midia');
+
+  // 2. Escolher variant (720p ou menor pra economizar banda)
+  let urlMedia = urlM3u8;
+  if (master.ehMaster) {
+    if (master.itens.length === 0) throw new Error('Master playlist sem variants');
+    const ordenado = [...master.itens].sort((a, b) => b.bandwidth - a.bandwidth);
+    const escolhido = ordenado.find(v => v.altura > 0 && v.altura <= 720) || ordenado[ordenado.length - 1];
+    urlMedia = new URL(escolhido.url, urlM3u8).toString();
+    console.log('[cortador-hls] variant escolhido:', escolhido.altura + 'p', '|', escolhido.bandwidth, 'bps');
+  }
+
+  // 3. Baixar media playlist (lista de .ts)
+  console.log('[cortador-hls] 2/5 - baixando playlist de midia');
+  const mediaTxt = await baixarTexto(urlMedia, headers);
+  const media = parseM3u8(mediaTxt);
+  if (media.itens.length === 0) throw new Error('Nenhum segmento .ts encontrado');
+  console.log('[cortador-hls] segmentos encontrados:', media.itens.length);
+
+  // 4. Baixar todos segmentos em paralelo (4 conexoes)
+  const pastaTemp = fs.mkdtempSync(path.join(os.tmpdir(), 'hls-segs-'));
+  try {
+    const urlsAbs = media.itens.map(s => new URL(s.url, urlMedia).toString());
+    console.log('[cortador-hls] 3/5 - baixando', urlsAbs.length, 'segmentos (4 paralelo)');
+    const arquivos = await baixarSegmentosParalelo(urlsAbs, headers, pastaTemp);
+
+    // 5. Concatenar em um unico .ts
+    const tsPath = path.join(pastaTemp, 'completo.ts');
+    console.log('[cortador-hls] 4/5 - concatenando segmentos');
+    await concatenarArquivos(arquivos, tsPath);
+    const tsSize = (fs.statSync(tsPath).size / 1024 / 1024).toFixed(1);
+    console.log('[cortador-hls] .ts montado:', tsSize, 'MB');
+
+    // 6. ffmpeg remux .ts -> .mp4 (operacao local, rapida, deve funcionar)
+    console.log('[cortador-hls] 5/5 - ffmpeg remux ts->mp4');
+    const r = await executar(FFMPEG, [
+      '-y',
+      '-i', tsPath,
+      '-c', 'copy',
+      '-bsf:a', 'aac_adtstoasc',
+      destinoMp4,
+    ], 'ffmpeg-remux');
+    if (r.codigo !== 0) throw new Error('ffmpeg remux falhou: codigo=' + r.codigo + ' sinal=' + r.sinal + ' | ' + (r.stderr || '').slice(-500));
+  } finally {
+    try { fs.rmSync(pastaTemp, { recursive: true, force: true }); } catch (e) {}
+  }
+}
+
+// ---- Helpers de download HTTP nativo do Node (sem ffmpeg) FIM ----
 function tempoValido(t) {
   return typeof t === 'string' && /^(\d{1,2}:)?\d{1,2}:\d{2}$|^\d{1,3}(:\d{2}){0,2}$|^\d+$/.test(t.trim());
 }
@@ -168,7 +332,7 @@ app.get('/', (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 25, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 26, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, videosNoCache: videosCacheados });
 });
 
 // Helper: roda um comando e retorna {codigo, sinal, stdout, stderr}
@@ -230,11 +394,11 @@ app.post('/cortar', async (req, res) => {
       console.log('[cortador] CACHE HIT - usando video ja baixado:', path.basename(fullPath));
     } else {
       const t1 = Date.now();
-      let comando, args;
+      let r1 = { codigo: 0, sinal: null, stderr: '', stdout: '' };
+
       if (tipoUrl === 'youtube') {
         console.log('[cortador] CACHE MISS - baixando do YouTube via yt-dlp | proxy:', PROXY_URL ? 'sim' : 'nao');
-        comando = YTDLP;
-        args = [
+        r1 = await executar(YTDLP, [
           '--no-playlist', '--no-warnings', '--no-progress',
           '--extractor-args', 'youtube:player_client=tv,web_safari,default',
           ...(cookiesOk ? ['--cookies', COOKIES_PATH] : []),
@@ -245,28 +409,19 @@ app.post('/cortar', async (req, res) => {
           '--merge-output-format', 'mp4',
           '-o', fullPath,
           url,
-        ];
+        ], 'yt-dlp-download');
       } else if (tipoUrl === 'hls') {
-        const origem = origemDaUrl(url);
-        console.log('[cortador] CACHE MISS - baixando HLS direto com ffmpeg | origem:', origem);
-        // ffmpeg suporta HLS nativamente - mais robusto que yt-dlp pra Panda
-        comando = FFMPEG;
-        args = [
-          '-y',
-          '-loglevel', 'warning',
-          ...(origem ? ['-headers', `Origin: ${origem}\r\nReferer: ${origem}/\r\n`] : []),
-          '-i', url,
-          '-c', 'copy',
-          '-bsf:a', 'aac_adtstoasc',
-          '-movflags', '+faststart',
-          fullPath,
-        ];
+        console.log('[cortador] CACHE MISS - baixando HLS (downloader Node nativo)');
+        try {
+          await baixarHLSCompleto(url, fullPath);
+        } catch (e) {
+          r1 = { codigo: -1, sinal: null, stderr: e.message, stdout: '' };
+        }
       } else {
         limpar(pasta);
         return res.status(400).json({ erro: 'Tipo de URL nao suportado.' });
       }
 
-      const r1 = await executar(comando, args, tipoUrl + '-download');
       const dt1 = ((Date.now() - t1) / 1000).toFixed(1);
       let baixadoMB = '?';
       try { if (fs.existsSync(fullPath)) baixadoMB = (fs.statSync(fullPath).size / 1024 / 1024).toFixed(1); } catch (e) {}
