@@ -10,6 +10,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const https = require('https');
+const zlib = require('zlib');
 
 const app = express();
 app.use(cors());
@@ -54,6 +55,29 @@ function garantirYtdlp() {
   return prontoYtdlp;
 }
 
+// ---- Baixa o ffmpeg (vem compactado .gz, descompacta na hora) ----
+const FFMPEG = path.join(os.tmpdir(), 'ffmpeg_bin');
+const FFMPEG_URL = 'https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-linux-x64.gz';
+let prontoFfmpeg = null;
+function garantirFfmpeg() {
+  if (prontoFfmpeg) return prontoFfmpeg;
+  prontoFfmpeg = new Promise((resolve, reject) => {
+    if (fs.existsSync(FFMPEG)) { try { fs.chmodSync(FFMPEG, 0o755); } catch (e) {} return resolve(); }
+    const baixar = (url) => {
+      https.get(url, (r) => {
+        if (r.statusCode >= 300 && r.statusCode < 400 && r.headers.location) return baixar(r.headers.location);
+        if (r.statusCode !== 200) return reject(new Error('Não consegui baixar o ffmpeg (' + r.statusCode + ')'));
+        const out = fs.createWriteStream(FFMPEG);
+        r.pipe(zlib.createGunzip()).pipe(out);
+        out.on('finish', () => out.close(() => { fs.chmodSync(FFMPEG, 0o755); resolve(); }));
+        out.on('error', reject);
+      }).on('error', reject);
+    };
+    baixar(FFMPEG_URL);
+  });
+  return prontoFfmpeg;
+}
+
 function linkValido(u) {
   return typeof u === 'string' && /^https:\/\/(www\.|m\.)?(youtube\.com\/|youtu\.be\/)/.test(u.trim());
 }
@@ -67,7 +91,7 @@ function paraSegundos(t) {
 }
 
 app.get('/', (_req, res) => res.type('html').send(PAGINA));
-app.get('/status', (_req, res) => res.json({ ok: true, servico: 'cortador', versao: 6, cookies: cookiesOk }));
+app.get('/status', (_req, res) => res.json({ ok: true, servico: 'cortador', versao: 7, cookies: cookiesOk }));
 
 app.post('/cortar', async (req, res) => {
   const url = (req.body.url || '').trim();
@@ -84,11 +108,13 @@ app.post('/cortar', async (req, res) => {
   let pasta;
   try {
     await garantirYtdlp();
+    await garantirFfmpeg();
     pasta = fs.mkdtempSync(path.join(os.tmpdir(), 'corte-'));
     const secao = `*${inicio}-${fim}`;
     const args = [
       '--no-playlist', '--no-warnings', '--no-progress',
       ...(cookiesOk ? ['--cookies', COOKIES_PATH] : ['--extractor-args', 'youtube:player_client=tv,web_safari,default']),
+      '--ffmpeg-location', FFMPEG,
       '-f', 'bv*+ba/b',
       '--download-sections', secao,
       '--force-keyframes-at-cuts',
