@@ -168,10 +168,10 @@ app.get('/', (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 23, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 24, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, videosNoCache: videosCacheados });
 });
 
-// Helper: roda um comando e retorna {codigo, stdout, stderr}
+// Helper: roda um comando e retorna {codigo, sinal, stdout, stderr}
 function executar(cmd, args, label) {
   return new Promise((resolve) => {
     console.log('[cortador]', label, 'iniciando...');
@@ -180,13 +180,13 @@ function executar(cmd, args, label) {
     let stderr = '';
     proc.stdout.on('data', d => { stdout += d.toString(); });
     proc.stderr.on('data', d => { stderr += d.toString(); });
-    proc.on('close', (codigo) => {
-      console.log('[cortador]', label, 'terminou com codigo', codigo);
+    proc.on('close', (codigo, sinal) => {
+      console.log('[cortador]', label, 'terminou com codigo', codigo, 'sinal', sinal);
       if (stderr) console.log('[cortador] stderr de', label + ':\n' + stderr.slice(-1500));
-      resolve({ codigo, stdout, stderr });
+      resolve({ codigo, sinal, stdout, stderr });
     });
     proc.on('error', (err) => {
-      resolve({ codigo: -1, stdout: '', stderr: 'erro ao executar: ' + err.message });
+      resolve({ codigo: -1, sinal: null, stdout: '', stderr: 'erro ao executar: ' + err.message });
     });
   });
 }
@@ -271,24 +271,43 @@ app.post('/cortar', async (req, res) => {
 
     // ETAPA 2: cortar localmente
     const t2 = Date.now();
-    console.log('[cortador] cortando | inicio', si, 's | duracao', duracao, 's | input', path.basename(fullPath));
-    const r2 = await executar(FFMPEG, [
-      '-y',
-      '-fflags', '+genpts+igndts',
-      '-ss', String(si),
-      '-i', fullPath,
-      '-t', String(duracao),
-      '-c', 'copy',
-      '-bsf:a', 'aac_adtstoasc',
-      '-avoid_negative_ts', 'make_zero',
-      cortePath,
-    ], 'ffmpeg-cut');
+    let tamanhoMB = '?';
+    try { tamanhoMB = (fs.statSync(fullPath).size / 1024 / 1024).toFixed(1); } catch (e) {}
+    console.log('[cortador] cortando | inicio', si, 's | duracao', duracao, 's | input', path.basename(fullPath), tamanhoMB, 'MB');
+
+    // Args do ffmpeg cut diferem por tipo:
+    // - mp4 (YouTube): -ss antes de -i (fast seek via index)
+    // - ts (HLS): -ss depois de -i (slow seek mas leve em memoria, sem precisar carregar index)
+    let cutArgs;
+    if (tipoUrl === 'hls') {
+      cutArgs = [
+        '-y',
+        '-threads', '1',
+        '-i', fullPath,
+        '-ss', String(si),
+        '-t', String(duracao),
+        '-c', 'copy',
+        '-bsf:a', 'aac_adtstoasc',
+        cortePath,
+      ];
+    } else {
+      cutArgs = [
+        '-y',
+        '-ss', String(si),
+        '-i', fullPath,
+        '-t', String(duracao),
+        '-c', 'copy',
+        '-avoid_negative_ts', 'make_zero',
+        cortePath,
+      ];
+    }
+    const r2 = await executar(FFMPEG, cutArgs, 'ffmpeg-cut');
     const dt2 = ((Date.now() - t2) / 1000).toFixed(1);
     console.log('[cortador] cut levou', dt2, 's | cache:', cacheHit ? 'HIT' : 'MISS');
 
     if (r2.codigo !== 0 || !fs.existsSync(cortePath)) {
       limpar(pasta);
-      return res.status(500).json({ erro: 'Baixei o video mas nao consegui cortar.', detalhe: `codigo=${r2.codigo} | ${(r2.stderr || 'sem detalhes').slice(-1500)}` });
+      return res.status(500).json({ erro: 'Baixei o video mas nao consegui cortar.', detalhe: `codigo=${r2.codigo} sinal=${r2.sinal} tamanho=${tamanhoMB}MB | ${(r2.stderr || 'sem detalhes').slice(-1500)}` });
     }
 
     res.download(cortePath, `corte_${inicio.replace(/:/g, '-')}_a_${fim.replace(/:/g, '-')}.mp4`, () => limpar(pasta));
