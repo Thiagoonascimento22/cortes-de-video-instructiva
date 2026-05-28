@@ -11,6 +11,7 @@ const os = require('os');
 const path = require('path');
 const https = require('https');
 const zlib = require('zlib');
+const AdmZip = require('adm-zip');
 
 const app = express();
 app.use(cors());
@@ -110,24 +111,18 @@ function garantirFfmpeg() {
         r.pipe(out);
         out.on('finish', () => {
           out.close(() => {
-            console.log('[cortador] ffmpeg baixado, descompactando...');
-            try { fs.mkdirSync(extractDir, { recursive: true }); } catch (e) {}
-            const proc = spawn('unzip', ['-o', zipPath, '-d', extractDir]);
-            let unzipErr = '';
-            proc.stderr.on('data', d => { unzipErr += d.toString(); });
-            proc.on('close', (code) => {
-              if (code !== 0) return reject(new Error('unzip falhou (' + code + '): ' + unzipErr));
-              try {
-                const ffmpegExtracted = path.join(extractDir, 'ffmpeg');
-                if (!fs.existsSync(ffmpegExtracted)) return reject(new Error('binary ffmpeg nao encontrado em ' + ffmpegExtracted));
-                fs.renameSync(ffmpegExtracted, FFMPEG);
-                fs.chmodSync(FFMPEG, 0o755);
-                try { fs.unlinkSync(zipPath); fs.rmSync(extractDir, { recursive: true, force: true }); } catch (e) {}
-                console.log('[cortador] ffmpeg 6.1 pronto em', FFMPEG);
-                resolve();
-              } catch (e) { reject(e); }
-            });
-            proc.on('error', (err) => reject(new Error('spawn unzip erro: ' + err.message)));
+            console.log('[cortador] ffmpeg baixado, descompactando (adm-zip)...');
+            try {
+              const zip = new AdmZip(zipPath);
+              zip.extractAllTo(extractDir, true);
+              const ffmpegExtracted = path.join(extractDir, 'ffmpeg');
+              if (!fs.existsSync(ffmpegExtracted)) return reject(new Error('binary ffmpeg nao encontrado em ' + ffmpegExtracted));
+              fs.renameSync(ffmpegExtracted, FFMPEG);
+              fs.chmodSync(FFMPEG, 0o755);
+              try { fs.unlinkSync(zipPath); fs.rmSync(extractDir, { recursive: true, force: true }); } catch (e) {}
+              console.log('[cortador] ffmpeg 6.1 pronto em', FFMPEG);
+              resolve();
+            } catch (e) { reject(new Error('erro extraindo zip: ' + e.message)); }
           });
         });
         out.on('error', reject);
@@ -151,7 +146,7 @@ function paraSegundos(t) {
 }
 
 app.get('/', (_req, res) => res.type('html').send(PAGINA));
-app.get('/status', (_req, res) => res.json({ ok: true, servico: 'cortador', versao: 18, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false }));
+app.get('/status', (_req, res) => res.json({ ok: true, servico: 'cortador', versao: 19, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false }));
 
 // Helper: roda um comando e retorna {codigo, stdout, stderr}
 function executar(cmd, args, label) {
