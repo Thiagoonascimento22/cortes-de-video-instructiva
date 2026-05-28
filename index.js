@@ -91,7 +91,7 @@ function paraSegundos(t) {
 }
 
 app.get('/', (_req, res) => res.type('html').send(PAGINA));
-app.get('/status', (_req, res) => res.json({ ok: true, servico: 'cortador', versao: 7, cookies: cookiesOk }));
+app.get('/status', (_req, res) => res.json({ ok: true, servico: 'cortador', versao: 8, cookies: cookiesOk }));
 
 app.post('/cortar', async (req, res) => {
   const url = (req.body.url || '').trim();
@@ -115,9 +115,8 @@ app.post('/cortar', async (req, res) => {
       '--no-playlist', '--no-warnings', '--no-progress',
       ...(cookiesOk ? ['--cookies', COOKIES_PATH] : ['--extractor-args', 'youtube:player_client=tv,web_safari,default']),
       '--ffmpeg-location', FFMPEG,
-      '-f', 'bv*+ba/b',
+      '-f', 'bv*[vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b',
       '--download-sections', secao,
-      '--force-keyframes-at-cuts',
       '--merge-output-format', 'mp4',
       '-o', path.join(pasta, 'corte.%(ext)s'),
       url,
