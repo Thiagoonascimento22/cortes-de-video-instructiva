@@ -126,7 +126,7 @@ function paraSegundos(t) {
 }
 
 app.get('/', (_req, res) => res.type('html').send(PAGINA));
-app.get('/status', (_req, res) => res.json({ ok: true, servico: 'cortador', versao: 11, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false }));
+app.get('/status', (_req, res) => res.json({ ok: true, servico: 'cortador', versao: 12, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false }));
 
 app.post('/cortar', async (req, res) => {
   const url = (req.body.url || '').trim();
@@ -152,7 +152,7 @@ app.post('/cortar', async (req, res) => {
       ...(cookiesOk ? ['--cookies', COOKIES_PATH] : []),
       ...(PROXY_URL ? ['--proxy', PROXY_URL] : []),
       '--ffmpeg-location', FFMPEG,
-      '-f', 'bv*[vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b',
+      '-f', 'bv*[vcodec^=avc1][height<=720]+ba[ext=m4a]/b[ext=mp4][height<=720]/b[ext=mp4]/b',
       '--download-sections', secao,
       '--merge-output-format', 'mp4',
       '-o', path.join(pasta, 'corte.%(ext)s'),
