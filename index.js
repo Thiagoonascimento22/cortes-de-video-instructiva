@@ -15,8 +15,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const YTDLP = path.join(os.tmpdir(), 'yt-dlp');
-const YTDLP_URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
+const YTDLP = path.join(os.tmpdir(), 'yt-dlp_bin');
+const YTDLP_URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
 const MAX_SEGUNDOS = 15 * 60;
 
 // A pagina do cortador (embutida)
@@ -54,7 +54,7 @@ function paraSegundos(t) {
 }
 
 app.get('/', (_req, res) => res.type('html').send(PAGINA));
-app.get('/status', (_req, res) => res.json({ ok: true, servico: 'cortador', versao: 4 }));
+app.get('/status', (_req, res) => res.json({ ok: true, servico: 'cortador', versao: 5 }));
 
 app.post('/cortar', async (req, res) => {
   const url = (req.body.url || '').trim();
