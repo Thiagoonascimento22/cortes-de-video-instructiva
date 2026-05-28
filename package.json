@@ -3,9 +3,12 @@
   "version": "1.0.0",
   "description": "Corta um trecho de um video do YouTube",
   "main": "index.js",
-  "scripts": { "start": "node index.js" },
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
-    "express": "^4.19.2",
-    "cors": "^2.8.5"
+    "adm-zip": "^0.5.17",
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
   }
 }
