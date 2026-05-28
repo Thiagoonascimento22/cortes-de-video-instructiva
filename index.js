@@ -58,7 +58,7 @@ function paraSegundos(t) {
 }
 
 // ---- Saúde do serviço ----
-app.get('/', (_req, res) => res.json({ ok: true, servico: 'cortador', versao: 1 }));
+app.get('/', (_req, res) => res.json({ ok: true, servico: 'cortador', versao: 2 }));
 
 // ---- O corte de verdade ----
 app.post('/cortar', async (req, res) => {
@@ -79,7 +79,8 @@ app.post('/cortar', async (req, res) => {
     pasta = fs.mkdtempSync(path.join(os.tmpdir(), 'corte-'));
     const secao = `*${inicio}-${fim}`;
     const args = [
-      '--no-playlist', '--no-warnings', '--quiet',
+      '--no-playlist', '--no-warnings', '--no-progress',
+      '--extractor-args', 'youtube:player_client=tv,web_safari,default',
       '-f', 'bv*+ba/b',
       '--download-sections', secao,
       '--force-keyframes-at-cuts',
@@ -88,14 +89,18 @@ app.post('/cortar', async (req, res) => {
       url,
     ];
 
+    console.log('[cortador] rodando yt-dlp | trecho', secao, '| url', url);
     const proc = spawn(YTDLP, args);
     let erroSaida = '';
     proc.stderr.on('data', d => { erroSaida += d.toString(); });
+    proc.stdout.on('data', d => { erroSaida += d.toString(); });
 
     proc.on('close', (codigo) => {
+      console.log('[cortador] yt-dlp terminou com codigo', codigo);
+      if (erroSaida) console.log('[cortador] saida do yt-dlp:\n' + erroSaida.slice(-1500));
       if (codigo !== 0) {
         limpar(pasta);
-        return res.status(500).json({ erro: 'Não rolou baixar esse trecho. Confere o link e os tempos.', detalhe: erroSaida.slice(-400) });
+        return res.status(500).json({ erro: 'Não rolou baixar esse trecho. Confere o link e os tempos.', detalhe: (erroSaida || 'sem detalhes').slice(-600) });
       }
       const arquivos = fs.readdirSync(pasta).filter(f => f.startsWith('corte'));
       if (!arquivos.length) { limpar(pasta); return res.status(500).json({ erro: 'O corte não foi gerado. Tenta de novo.' }); }
