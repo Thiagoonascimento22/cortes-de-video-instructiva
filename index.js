@@ -200,10 +200,18 @@ garantirLogo();
 // Pode ser sobrescrita via env var COBALT_API_URL no Railway
 const COBALT_API_URL = (process.env.COBALT_API_URL || 'https://cobalt-production-2fb0.up.railway.app').replace(/\/+$/, '');
 
-function baixarViaCobalt(videoUrl, destPath) {
+function baixarViaCobalt(videoUrl, destPath, modo) {
+  // modo: 'video' (default) ou 'audio'
   return new Promise((resolve, reject) => {
     if (!COBALT_API_URL) return reject(new Error('COBALT_API_URL nao configurada'));
-    const body = JSON.stringify({
+    const body = JSON.stringify(modo === 'audio' ? {
+      url: videoUrl,
+      downloadMode: 'audio',
+      audioFormat: 'mp3',
+      audioBitrate: '128',
+      filenameStyle: 'basic',
+      youtubeDubLang: 'pt'
+    } : {
       url: videoUrl,
       videoQuality: '1080',
       audioBitrate: '256',
@@ -906,7 +914,7 @@ app.get('/', requireAuth, (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 71, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 72, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
 });
 
 // Checa se um video URL já está em cache (front faz polling pra mostrar status do background download)
@@ -1486,61 +1494,114 @@ app.post('/analisar', requireAuth, upload.single('arquivo'), async (req, res) =>
       console.log('[cortador-analisar] usando arquivo enviado:', arquivoUpload.originalname, '|', (arquivoUpload.size/1024/1024).toFixed(1), 'MB');
       fullPath = arquivoUpload.path;
     } else {
-      // YouTube: baixar APENAS audio (m4a/webm), nao video completo!
-      // Isso reduz download de ~2GB (1080p 3h) pra ~200MB (audio 3h)
-      console.log('[cortador-analisar] baixando APENAS audio (otimizado)...');
-      const FMT_AUDIO = 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio';
-      const estrategias = [
-        'youtube:player_client=tv,web_safari',
-        'youtube:player_client=web_safari,default',
-        'youtube:player_client=ios',
-        'youtube:player_client=tv_embedded,android',
-        'youtube:player_client=mweb',
-      ];
+      // YouTube: baixar APENAS audio em CASCATA de fallbacks
+      console.log('[cortador-analisar] baixando audio (cascata de tentativas)...');
       const tDl0 = Date.now();
-      const audioOriginalTpl = path.join(pasta, 'audio_original.%(ext)s');
-      let ultimoErro = '';
       let ok = false;
       let audioOriginal = null;
-      for (const ext of estrategias) {
-        console.log('[cortador-analisar] yt-dlp audio tentando:', ext);
-        // Limpa qualquer arquivo audio_original anterior
+      let ultimoErro = '';
+
+      // TENTATIVA 1: Cobalt em modo audio (sem cookies necessárias — usa innertube API)
+      if (COBALT_API_URL) {
         try {
-          for (const f of fs.readdirSync(pasta)) {
-            if (f.startsWith('audio_original.')) fs.unlinkSync(path.join(pasta, f));
+          const cobaltPath = path.join(pasta, 'audio_cobalt.mp3');
+          console.log('[cortador-analisar] tentativa 1: Cobalt audio mode (sem cookies)');
+          await baixarViaCobalt(url, cobaltPath, 'audio');
+          if (fs.existsSync(cobaltPath) && fs.statSync(cobaltPath).size > 50 * 1024) {
+            audioOriginal = cobaltPath;
+            ok = true;
+            console.log('[cortador-analisar] ✓ Cobalt audio OK em', ((Date.now()-tDl0)/1000).toFixed(1), 's |', (fs.statSync(cobaltPath).size/1024/1024).toFixed(1), 'MB');
           }
-        } catch (e) {}
-        const r = await executar(YTDLP, [
-          '--no-playlist', '--no-warnings', '--no-progress',
-          '--extractor-args', ext,
-          ...(cookiesOk ? ['--cookies', COOKIES_PATH] : []),
-          ...(PROXY_URL ? ['--proxy', PROXY_URL] : []),
-          '--ffmpeg-location', FFMPEG,
-          '-N', '4',
-          '-f', FMT_AUDIO,
-          '-o', audioOriginalTpl,
-          url,
-        ], 'yt-dlp-audio');
-        // Procura arquivo baixado (extensao varia: m4a, webm, opus, etc)
-        try {
-          const f = fs.readdirSync(pasta).find(x => x.startsWith('audio_original.'));
-          if (r.codigo === 0 && f) {
-            const p = path.join(pasta, f);
-            if (fs.statSync(p).size > 50 * 1024) {
-              audioOriginal = p;
-              ok = true;
-              console.log('[cortador-analisar] audio baixado em', ((Date.now()-tDl0)/1000).toFixed(1), 's |', (fs.statSync(p).size/1024/1024).toFixed(1), 'MB |', ext);
-              break;
-            }
-          }
-        } catch (e) {}
-        ultimoErro = (r.stderr || r.stdout || '').slice(-300);
-        console.log('[cortador-analisar] tentativa falhou:', ultimoErro.slice(-150));
+        } catch (e) {
+          ultimoErro = 'Cobalt: ' + e.message;
+          console.log('[cortador-analisar] Cobalt audio falhou:', e.message);
+        }
       }
+
+      // TENTATIVA 2: yt-dlp com bestaudio (varias estrategias)
+      if (!ok) {
+        console.log('[cortador-analisar] tentativa 2: yt-dlp bestaudio');
+        const FMT_AUDIO = 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio';
+        const estrategias = [
+          'youtube:player_client=tv,web_safari',
+          'youtube:player_client=web_safari,default',
+          'youtube:player_client=ios',
+          'youtube:player_client=tv_embedded,android',
+          'youtube:player_client=mweb',
+        ];
+        const audioOriginalTpl = path.join(pasta, 'audio_original.%(ext)s');
+        for (const ext of estrategias) {
+          // Limpa qualquer arquivo anterior
+          try {
+            for (const f of fs.readdirSync(pasta)) {
+              if (f.startsWith('audio_original.')) fs.unlinkSync(path.join(pasta, f));
+            }
+          } catch (e) {}
+          const r = await executar(YTDLP, [
+            '--no-playlist', '--no-warnings', '--no-progress',
+            '--extractor-args', ext,
+            ...(cookiesOk ? ['--cookies', COOKIES_PATH] : []),
+            ...(PROXY_URL ? ['--proxy', PROXY_URL] : []),
+            '--ffmpeg-location', FFMPEG,
+            '-N', '4',
+            '-f', FMT_AUDIO,
+            '-o', audioOriginalTpl,
+            url,
+          ], 'yt-dlp-audio');
+          try {
+            const f = fs.readdirSync(pasta).find(x => x.startsWith('audio_original.'));
+            if (r.codigo === 0 && f) {
+              const p = path.join(pasta, f);
+              if (fs.statSync(p).size > 50 * 1024) {
+                audioOriginal = p;
+                ok = true;
+                console.log('[cortador-analisar] ✓ yt-dlp audio OK em', ((Date.now()-tDl0)/1000).toFixed(1), 's |', (fs.statSync(p).size/1024/1024).toFixed(1), 'MB | extractor:', ext);
+                break;
+              }
+            }
+          } catch (e) {}
+          ultimoErro = (r.stderr || r.stdout || '').slice(-300);
+        }
+      }
+
+      // TENTATIVA 3: yt-dlp baixa video COMPLETO (mais lento, último recurso)
+      if (!ok) {
+        console.log('[cortador-analisar] tentativa 3: yt-dlp video completo (fallback final)');
+        const videoFallback = path.join(pasta, 'video_fallback.mp4');
+        const FMT_VIDEO = 'b[height<=720]/best';
+        const estrategiasVideo = [
+          'youtube:player_client=tv,web_safari',
+          'youtube:player_client=ios',
+          'youtube:player_client=tv_embedded,android',
+        ];
+        for (const ext of estrategiasVideo) {
+          try { if (fs.existsSync(videoFallback)) fs.unlinkSync(videoFallback); } catch (e) {}
+          const r = await executar(YTDLP, [
+            '--no-playlist', '--no-warnings', '--no-progress',
+            '--extractor-args', ext,
+            ...(cookiesOk ? ['--cookies', COOKIES_PATH] : []),
+            ...(PROXY_URL ? ['--proxy', PROXY_URL] : []),
+            '--ffmpeg-location', FFMPEG,
+            '-N', '4',
+            '-f', FMT_VIDEO,
+            '--merge-output-format', 'mp4',
+            '-o', videoFallback,
+            url,
+          ], 'yt-dlp-video-fallback');
+          if (r.codigo === 0 && fs.existsSync(videoFallback) && fs.statSync(videoFallback).size > 1024 * 1024) {
+            audioOriginal = videoFallback;
+            ok = true;
+            console.log('[cortador-analisar] ✓ video completo (fallback) OK em', ((Date.now()-tDl0)/1000).toFixed(1), 's | extractor:', ext);
+            break;
+          }
+          ultimoErro = (r.stderr || r.stdout || '').slice(-300);
+        }
+      }
+
       if (!ok) {
         limpar(pasta);
         return res.status(500).json({
-          erro: 'Nao consegui baixar o audio desse video. Tenta com upload de arquivo.',
+          erro: 'Não consegui baixar esse vídeo nem por Cobalt nem por yt-dlp. Os cookies podem ter expirado — atualiza no /admin. Ou tenta upload de arquivo.',
           detalhe: ultimoErro
         });
       }
