@@ -584,7 +584,7 @@ app.get('/', requireAuth, (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 58, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 59, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
 });
 
 // ============ ADMIN: atualizar cookies sem mexer no Railway ============
@@ -874,7 +874,7 @@ async function processarCorte(req, res) {
       let filtroV;
       if (formato === 'centro_blur') {
         // Vídeo no centro com fundo desfocado
-        filtroV = 'split=2[a][b];[a]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,boxblur=20:1[bg];[b]scale=720:-1[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2';
+        filtroV = 'split=2[a][b];[a]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,boxblur=10:1[bg];[b]scale=720:-1[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2';
       } else if (formato === 'crop') {
         // Crop central, zoom no meio
         filtroV = 'crop=ih*9/16:ih,scale=720:1280';
@@ -922,7 +922,7 @@ Dialogue: 0,0:00:00.00,9:00:00.00,Default,,0,0,0,,${textoUp}
           '-map', '[vout]',
           '-map', '0:a?',
           '-c:v', 'libx264',
-          '-preset', 'medium',
+          '-preset', 'fast',
           '-crf', '18',
           '-tune', 'film',
           '-pix_fmt', 'yuv420p',
@@ -940,7 +940,7 @@ Dialogue: 0,0:00:00.00,9:00:00.00,Default,,0,0,0,,${textoUp}
           ...(temTempos ? ['-t', String(duracao)] : []),
           '-vf', filtroV,
           '-c:v', 'libx264',
-          '-preset', 'medium',
+          '-preset', 'fast',
           '-crf', '18',
           '-tune', 'film',
           '-pix_fmt', 'yuv420p',
@@ -1008,7 +1008,7 @@ app.post('/analisar', requireAuth, upload.single('arquivo'), async (req, res) =>
       fullPath = arquivoUpload.path;
     } else {
       // YouTube: baixa (usa cache existente)
-      const cachePath = cachePathPara(url, '.mp4');
+      const cachePath = cachePathPara(url, 'mp4');
       if (fs.existsSync(cachePath) && (Date.now() - fs.statSync(cachePath).mtimeMs) < CACHE_TTL_MS) {
         console.log('[cortador-analisar] usando video do cache');
         fullPath = cachePath;
