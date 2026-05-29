@@ -427,6 +427,69 @@ function transcreverComGroq(audioPath) {
 }
 
 // ---- Analisa transcricao com Gemini e retorna melhores momentos ----
+// ---- Transcreve áudio em chunks quando passa do limite do Groq (25MB) ----
+async function transcreverComGroqEmChunks(audioPath, duracaoTotalSeg) {
+  const tamanho = fs.statSync(audioPath).size;
+  const LIMITE_GROQ = 24 * 1024 * 1024; // 24MB pra ter margem do limite de 25MB
+
+  // Se cabe num único request, manda direto
+  if (tamanho <= LIMITE_GROQ) {
+    return await transcreverComGroq(audioPath);
+  }
+
+  // Divide em chunks de ~45 minutos (a 32kbps = ~10.8MB cada)
+  const CHUNK_SEG = 45 * 60;
+  const numChunks = Math.ceil(duracaoTotalSeg / CHUNK_SEG);
+  console.log('[cortador] audio com', (tamanho/1024/1024).toFixed(1), 'MB excede limite. Dividindo em', numChunks, 'chunks de ~45min cada...');
+
+  const todasSegments = [];
+  const todasWords = [];
+  let textoCompleto = '';
+
+  for (let i = 0; i < numChunks; i++) {
+    const offset = i * CHUNK_SEG;
+    const duracao = Math.min(CHUNK_SEG, duracaoTotalSeg - offset);
+    const chunkPath = audioPath.replace(/\.mp3$/i, '_chunk' + i + '.mp3');
+
+    // Extrai esse chunk (corte rapido com -c copy)
+    await new Promise((res, rej) => {
+      const args = [
+        '-y',
+        '-ss', String(offset),
+        '-i', audioPath,
+        '-t', String(duracao),
+        '-c', 'copy',
+        chunkPath
+      ];
+      const p = spawn(FFMPEG, args);
+      let stderr = '';
+      p.stderr.on('data', d => { stderr += d.toString(); });
+      p.on('close', code => code === 0 && fs.existsSync(chunkPath) ? res() : rej(new Error('chunk ' + i + ' falhou: ' + stderr.slice(-200))));
+    });
+
+    console.log('[cortador] transcrevendo chunk', (i+1) + '/' + numChunks, '(' + (offset/60).toFixed(0) + 'min →', ((offset+duracao)/60).toFixed(0) + 'min)...');
+    const t = await transcreverComGroq(chunkPath);
+
+    // Ajusta timestamps somando o offset do chunk
+    (t.segments || []).forEach(s => {
+      todasSegments.push({ start: s.start + offset, end: s.end + offset, text: s.text });
+    });
+    (t.words || []).forEach(w => {
+      todasWords.push({ word: w.word, start: w.start + offset, end: w.end + offset });
+    });
+    textoCompleto += ' ' + (t.text || '');
+
+    try { fs.unlinkSync(chunkPath); } catch (e) {}
+  }
+
+  console.log('[cortador] chunks concatenados:', todasSegments.length, 'segmentos |', todasWords.length, 'palavras');
+  return {
+    text: textoCompleto.trim(),
+    segments: todasSegments,
+    words: todasWords
+  };
+}
+
 function analisarComGemini(transcricao, duracaoTotalSeg) {
   return new Promise((resolve, reject) => {
     if (!GEMINI_API_KEY) return reject(new Error('GEMINI_API_KEY nao configurada'));
@@ -652,7 +715,7 @@ app.get('/', requireAuth, (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 65, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 66, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
 });
 
 // ============ ADMIN: atualizar cookies sem mexer no Railway ============
@@ -1207,11 +1270,7 @@ app.post('/analisar', requireAuth, upload.single('arquivo'), async (req, res) =>
     const tamAudio = fs.statSync(audioPath).size;
     console.log('[cortador-analisar] audio extraido em', ((Date.now()-t1)/1000).toFixed(1), 's |', (tamAudio/1024/1024).toFixed(1), 'MB');
 
-    // Groq tem limite de 40MB por arquivo
-    if (tamAudio > 39 * 1024 * 1024) {
-      limpar(pasta);
-      return res.status(400).json({ erro: 'Esse video e muito longo pra analise por IA (limite ~5h de audio).' });
-    }
+    // Sem limite de tamanho — Groq divide em chunks automaticamente se passar de 24MB
 
     // 3. Pegar duracao total do video (via ffprobe)
     let duracaoTotal = 0;
@@ -1220,12 +1279,12 @@ app.post('/analisar', requireAuth, upload.single('arquivo'), async (req, res) =>
       const m = (probe.stderr || '').match(/Duration:\s*(\d+):(\d+):(\d+\.\d+)/);
       if (m) duracaoTotal = parseInt(m[1])*3600 + parseInt(m[2])*60 + parseFloat(m[3]);
     } catch (e) {}
-    console.log('[cortador-analisar] duracao total:', duracaoTotal.toFixed(0), 's');
+    console.log('[cortador-analisar] duracao total:', duracaoTotal.toFixed(0), 's (' + (duracaoTotal/60).toFixed(1) + ' min)');
 
-    // 4. Transcrever com Groq
+    // 4. Transcrever com Groq (divide em chunks de 45min se passar de 24MB)
     console.log('[cortador-analisar] transcrevendo com Groq...');
     const t2 = Date.now();
-    const transcricao = await transcreverComGroq(audioPath);
+    const transcricao = await transcreverComGroqEmChunks(audioPath, duracaoTotal);
     console.log('[cortador-analisar] transcricao em', ((Date.now()-t2)/1000).toFixed(1), 's |', (transcricao.words || []).length, 'palavras com timing');
 
     // Salva transcricao no cache (junto com video) pra /cortar usar nas legendas
