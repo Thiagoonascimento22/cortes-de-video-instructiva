@@ -179,11 +179,12 @@ function baixarViaCobalt(videoUrl, destPath) {
     if (!COBALT_API_URL) return reject(new Error('COBALT_API_URL nao configurada'));
     const body = JSON.stringify({
       url: videoUrl,
-      videoQuality: 'max',
+      videoQuality: '1080',
       audioBitrate: '256',
       filenameStyle: 'basic',
       downloadMode: 'auto',
-      youtubeVideoCodec: 'h264'
+      youtubeVideoCodec: 'h264',
+      youtubeHLS: false
     });
     const u = new URL(COBALT_API_URL + '/');
     const req = https.request({
@@ -375,7 +376,7 @@ app.get('/', requireAuth, (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 49, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 52, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
 });
 
 // ============ ADMIN: atualizar cookies sem mexer no Railway ============
@@ -539,55 +540,76 @@ async function processarCorte(req, res) {
       let cobaltErro = null;
       let cobaltOk = false;
 
-      // TENTATIVA 1: Cobalt proprio (rapido, confiavel)
-      if (COBALT_API_URL) {
+      // TENTATIVA 1: yt-dlp PRIMEIRO em 1080p forcado (melhor qualidade)
+      let r1 = null;
+      let ytdlpOk = false;
+      const estrategias = [
+        { ext: 'youtube:player_client=tv,web_safari',                fmt: 'bv*[height<=1080]+ba/b[height<=1080]/best' },
+        { ext: 'youtube:player_client=web_safari,default',           fmt: 'bv*[height<=1080]+ba/b[height<=1080]/best' },
+        { ext: 'youtube:player_client=ios',                          fmt: 'bv*[height<=1080]+ba/b[height<=1080]/best' },
+        { ext: 'youtube:player_client=tv_embedded,android',          fmt: 'bv*[height<=1080]+ba/b[height<=1080]/best' },
+        { ext: 'youtube:player_client=mweb',                         fmt: 'best' },
+      ];
+      for (let i = 0; i < estrategias.length; i++) {
+        const { ext, fmt } = estrategias[i];
+        console.log('[cortador] yt-dlp tentativa', i+1, '| extractor:', ext, '| fmt:', fmt || 'auto');
+        const args = [
+          '--no-playlist', '--no-warnings', '--no-progress',
+          '--extractor-args', ext,
+          ...(cookiesOk ? ['--cookies', COOKIES_PATH] : []),
+          ...(PROXY_URL ? ['--proxy', PROXY_URL] : []),
+          '--ffmpeg-location', FFMPEG,
+          '-N', '4',
+          '--retries', '2',
+          ...(fmt ? ['-f', fmt] : []),
+          '--merge-output-format', 'mp4',
+          '-o', fullPath,
+          url,
+        ];
+        r1 = await executar(YTDLP, args, 'yt-dlp-download');
+        if (r1.codigo === 0 && fs.existsSync(fullPath) && fs.statSync(fullPath).size > 1024 * 1024) {
+          // Validar resolucao real do arquivo
+          try {
+            const probe = await executar(FFMPEG, ['-i', fullPath, '-hide_banner'], 'ffprobe-check');
+            const stderr = probe.stderr || '';
+            const m = stderr.match(/Video:[^,]+,[^,]+,\s*(\d+)x(\d+)/);
+            const altura = m ? parseInt(m[2]) : 0;
+            const mb = (fs.statSync(fullPath).size/1024/1024).toFixed(1);
+            console.log('[cortador] tentativa', i+1, ': baixou', mb, 'MB |', m ? `${m[1]}x${m[2]}` : 'sem info', '|', altura, 'px');
+            if (altura >= 720) {
+              console.log('[cortador] yt-dlp OK na tentativa', i+1, '(qualidade boa)');
+              ytdlpOk = true;
+              break;
+            } else {
+              console.log('[cortador] qualidade baixa (', altura, 'px), descartando e tentando proxima estrategia');
+              try { fs.unlinkSync(fullPath); } catch (e) {}
+              continue;
+            }
+          } catch (e) {
+            console.log('[cortador] ffprobe falhou, mas arquivo OK, usando');
+            ytdlpOk = true;
+            break;
+          }
+        }
+        try { if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath); } catch (e) {}
+      }
+
+      // TENTATIVA 2: Cobalt como FALLBACK (so se yt-dlp falhou)
+      if (!ytdlpOk && COBALT_API_URL) {
+        try { if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath); } catch (e) {}
+        console.log('[cortador] yt-dlp falhou em todas. Tentando Cobalt como fallback...');
         try {
           await baixarViaCobalt(url, fullPath);
           if (fs.existsSync(fullPath) && fs.statSync(fullPath).size > 1024 * 1024) {
             cobaltOk = true;
-            console.log('[cortador] Cobalt baixou em', ((Date.now()-tDownload)/1000).toFixed(1), 's');
+            console.log('[cortador] Cobalt fallback baixou em', ((Date.now()-tDownload)/1000).toFixed(1), 's');
           } else {
             throw new Error('arquivo muito pequeno');
           }
         } catch (e) {
           cobaltErro = e.message;
-          console.log('[cortador] Cobalt falhou:', e.message, '- tentando yt-dlp como fallback...');
+          console.log('[cortador] Cobalt fallback tambem falhou:', e.message);
           try { if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath); } catch (e2) {}
-        }
-      }
-
-      // TENTATIVA 2: yt-dlp como fallback (5 estrategias)
-      let r1 = null;
-      if (!cobaltOk) {
-        const estrategias = [
-          { ext: 'youtube:player_client=mweb,tv_embedded,web_safari', fmt: 'bv*[height<=1080]+ba/b[height<=1080]/best' },
-          { ext: 'youtube:player_client=ios,android',                  fmt: 'best[height<=1080]/best' },
-          { ext: 'youtube:player_client=tv,web_safari,default',        fmt: null },
-          { ext: 'youtube:player_client=web,web_safari',               fmt: null },
-          { ext: 'youtube:player_client=mweb',                         fmt: 'best' },
-        ];
-        for (let i = 0; i < estrategias.length; i++) {
-          const { ext, fmt } = estrategias[i];
-          console.log('[cortador] yt-dlp tentativa', i+1, '| extractor:', ext, '| fmt:', fmt || 'auto');
-          const args = [
-            '--no-playlist', '--no-warnings', '--no-progress',
-            '--extractor-args', ext,
-            ...(cookiesOk ? ['--cookies', COOKIES_PATH] : []),
-            ...(PROXY_URL ? ['--proxy', PROXY_URL] : []),
-            '--ffmpeg-location', FFMPEG,
-            '-N', '4',
-            '--retries', '2',
-            ...(fmt ? ['-f', fmt] : []),
-            '--merge-output-format', 'mp4',
-            '-o', fullPath,
-            url,
-          ];
-          r1 = await executar(YTDLP, args, 'yt-dlp-download');
-          if (r1.codigo === 0 && fs.existsSync(fullPath) && fs.statSync(fullPath).size > 1024 * 1024) {
-            console.log('[cortador] yt-dlp OK na tentativa', i+1);
-            break;
-          }
-          try { if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath); } catch (e) {}
         }
       }
 
@@ -609,6 +631,22 @@ async function processarCorte(req, res) {
 
     const t2 = Date.now();
     console.log('[cortador] cortando | formato', formato, '| inicio', si, 's | duracao', duracao, 's');
+
+    // DEBUG: rodar ffprobe pra ver qualidade do arquivo baixado
+    if (!isUpload) {
+      try {
+        const probe = await executar(FFMPEG, ['-i', fullPath, '-hide_banner'], 'ffprobe');
+        const stderr = probe.stderr || '';
+        const videoLine = stderr.split('\n').find(l => l.includes('Video:')) || 'nao achei linha video';
+        const audioLine = stderr.split('\n').find(l => l.includes('Audio:')) || '';
+        const sz = (fs.statSync(fullPath).size / 1024 / 1024).toFixed(1);
+        console.log('[cortador] === INFO DO ARQUIVO BAIXADO ===');
+        console.log('[cortador] tamanho:', sz, 'MB');
+        console.log('[cortador] video:', videoLine.trim());
+        console.log('[cortador] audio:', audioLine.trim());
+        console.log('[cortador] ============================');
+      } catch (e) { console.log('[cortador] ffprobe erro:', e.message); }
+    }
 
     let cutArgs;
     if (formato === 'original') {
