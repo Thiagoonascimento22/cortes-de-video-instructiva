@@ -403,8 +403,9 @@ ${texto}`;
       contents: [{ parts: [{ text: prompt }] }],
       generationConfig: {
         temperature: 0.7,
-        maxOutputTokens: 4096,
-        responseMimeType: 'application/json'
+        maxOutputTokens: 16384,
+        responseMimeType: 'application/json',
+        thinkingConfig: { thinkingBudget: 0 }
       }
     });
 
@@ -416,7 +417,7 @@ ${texto}`;
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(body),
       },
-      timeout: 60000,
+      timeout: 90000,
     }, (r) => {
       let data = '';
       r.on('data', c => { data += c; });
@@ -426,11 +427,41 @@ ${texto}`;
         }
         try {
           const j = JSON.parse(data);
-          const conteudo = j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts && j.candidates[0].content.parts[0].text;
-          if (!conteudo) return reject(new Error('Gemini sem conteudo'));
-          const obj = JSON.parse(conteudo);
-          console.log('[cortador] Gemini retornou', (obj.momentos || []).length, 'momentos');
-          resolve(obj.momentos || []);
+          const cand = j.candidates && j.candidates[0];
+          if (!cand) return reject(new Error('Gemini sem candidates: ' + data.slice(0, 300)));
+          const finish = cand.finishReason;
+          const conteudo = cand.content && cand.content.parts && cand.content.parts[0] && cand.content.parts[0].text;
+          if (!conteudo) {
+            return reject(new Error('Gemini sem conteudo (finish: ' + finish + ')'));
+          }
+          if (finish && finish !== 'STOP') {
+            console.log('[cortador] Gemini finishReason:', finish, '| length conteudo:', conteudo.length);
+          }
+          // Tentar parsear como JSON. Se cortou, tenta consertar fechando arrays/objetos abertos
+          let obj;
+          try {
+            obj = JSON.parse(conteudo);
+          } catch (e1) {
+            // JSON cortado. Tenta consertar:
+            console.log('[cortador] JSON cortado, tentando consertar...');
+            let s = conteudo.trim();
+            // Remove o ultimo objeto incompleto (depois da ultima virgula)
+            const lastCompleteObj = s.lastIndexOf('},');
+            if (lastCompleteObj > 0) {
+              s = s.slice(0, lastCompleteObj + 1) + ']}';
+              try {
+                obj = JSON.parse(s);
+                console.log('[cortador] JSON consertado com sucesso (descartou ultimo item incompleto)');
+              } catch (e2) {
+                return reject(new Error('Resposta Gemini truncada e nao consegui consertar (finish: ' + finish + ')'));
+              }
+            } else {
+              return reject(new Error('Resposta Gemini muito curta ou invalida (finish: ' + finish + ')'));
+            }
+          }
+          const momentos = obj.momentos || [];
+          console.log('[cortador] Gemini retornou', momentos.length, 'momentos | finish:', finish);
+          resolve(momentos);
         } catch (e) {
           reject(new Error('Resposta Gemini invalida: ' + data.slice(0, 300)));
         }
@@ -553,7 +584,7 @@ app.get('/', requireAuth, (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 57, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 58, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
 });
 
 // ============ ADMIN: atualizar cookies sem mexer no Railway ============
