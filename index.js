@@ -715,7 +715,7 @@ app.get('/', requireAuth, (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 66, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 67, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
 });
 
 // ============ ADMIN: atualizar cookies sem mexer no Railway ============
@@ -1183,84 +1183,77 @@ app.post('/analisar', requireAuth, upload.single('arquivo'), async (req, res) =>
     await garantirFfmpeg();
 
     pasta = fs.mkdtempSync(path.join(os.tmpdir(), 'cortador-analise-'));
-    const videoPath = path.join(pasta, 'video.mp4');
     const audioPath = path.join(pasta, 'audio.mp3');
 
-    // Decide a fonte do video
-    let fullPath;
+    // Decide a fonte do audio:
+    // - Se arquivo upload: extrai audio do arquivo
+    // - Se YouTube: baixa SO o audio direto (rapido!)
+    let fullPath = null; // arquivo de origem (video ou audio bruto)
+    let pulaExtracao = false; // se já temos audio mp3 pronto, pula extração
     if (arquivoUpload) {
-      // Upload de arquivo: usa direto
+      // Upload de arquivo: usa direto, vai extrair audio depois
       console.log('[cortador-analisar] usando arquivo enviado:', arquivoUpload.originalname, '|', (arquivoUpload.size/1024/1024).toFixed(1), 'MB');
       fullPath = arquivoUpload.path;
     } else {
-      // YouTube: baixa (usa cache existente)
-      const cachePath = cachePathPara(url, 'mp4');
-      if (fs.existsSync(cachePath) && (Date.now() - fs.statSync(cachePath).mtimeMs) < CACHE_TTL_MS) {
-        console.log('[cortador-analisar] usando video do cache');
-        fullPath = cachePath;
-      } else {
-        console.log('[cortador-analisar] baixando video...');
-        const FMT_HQ = 'bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/best';
-        const estrategias = [
-          'youtube:player_client=tv,web_safari',
-          'youtube:player_client=web_safari,default',
-          'youtube:player_client=ios',
-          'youtube:player_client=tv_embedded,android',
-          'youtube:player_client=mweb',
-        ];
-        let ultimoErro = '';
-        let ok = false;
-        for (const ext of estrategias) {
-          console.log('[cortador-analisar] yt-dlp tentando:', ext);
-          const r = await executar(YTDLP, [
-            '--no-playlist', '--no-warnings', '--no-progress',
-            '--extractor-args', ext,
-            ...(cookiesOk ? ['--cookies', COOKIES_PATH] : []),
-            ...(PROXY_URL ? ['--proxy', PROXY_URL] : []),
-            '--ffmpeg-location', FFMPEG,
-            '-N', '4',
-            '-f', FMT_HQ,
-            '--merge-output-format', 'mp4',
-            '-o', videoPath,
-            url,
-          ], 'yt-dlp-analise');
-          if (r.codigo === 0 && fs.existsSync(videoPath) && fs.statSync(videoPath).size > 1024 * 1024) {
-            ok = true;
-            console.log('[cortador-analisar] yt-dlp OK com', ext);
-            break;
-          }
-          ultimoErro = (r.stderr || r.stdout || '').slice(-300);
-          console.log('[cortador-analisar] tentativa falhou:', ultimoErro.slice(-200));
-          try { if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath); } catch (e) {}
-        }
-        let cobaltErro = '';
-        if (!ok && COBALT_API_URL) {
-          console.log('[cortador-analisar] yt-dlp falhou em todas, tentando Cobalt...');
-          try {
-            await baixarViaCobalt(url, videoPath);
-            if (fs.existsSync(videoPath) && fs.statSync(videoPath).size > 1024 * 1024) {
-              ok = true;
-              console.log('[cortador-analisar] Cobalt OK');
-            }
-          } catch (e) {
-            cobaltErro = e.message;
-            console.log('[cortador-analisar] Cobalt falhou:', cobaltErro);
-          }
-        }
-        if (!ok) {
-          limpar(pasta);
-          return res.status(500).json({
-            erro: 'Nao consegui baixar esse video do YouTube. Tenta com upload de arquivo (botao "Arquivo" acima).',
-            detalhe: 'yt-dlp: ' + ultimoErro + '\n\ncobalt: ' + cobaltErro
-          });
-        }
+      // YouTube: baixar APENAS audio (m4a/webm), nao video completo!
+      // Isso reduz download de ~2GB (1080p 3h) pra ~200MB (audio 3h)
+      console.log('[cortador-analisar] baixando APENAS audio (otimizado)...');
+      const FMT_AUDIO = 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio';
+      const estrategias = [
+        'youtube:player_client=tv,web_safari',
+        'youtube:player_client=web_safari,default',
+        'youtube:player_client=ios',
+        'youtube:player_client=tv_embedded,android',
+        'youtube:player_client=mweb',
+      ];
+      const tDl0 = Date.now();
+      const audioOriginalTpl = path.join(pasta, 'audio_original.%(ext)s');
+      let ultimoErro = '';
+      let ok = false;
+      let audioOriginal = null;
+      for (const ext of estrategias) {
+        console.log('[cortador-analisar] yt-dlp audio tentando:', ext);
+        // Limpa qualquer arquivo audio_original anterior
         try {
-          fs.mkdirSync(CACHE_DIR, { recursive: true });
-          fs.copyFileSync(videoPath, cachePath);
-          console.log('[cortador-analisar] video salvo no cache:', path.basename(cachePath), '|', (fs.statSync(cachePath).size/1024/1024).toFixed(1), 'MB');
-        } catch (e) { console.log('[cortador-analisar] ERRO copiando video pro cache:', e.message); }
-        fullPath = videoPath;
+          for (const f of fs.readdirSync(pasta)) {
+            if (f.startsWith('audio_original.')) fs.unlinkSync(path.join(pasta, f));
+          }
+        } catch (e) {}
+        const r = await executar(YTDLP, [
+          '--no-playlist', '--no-warnings', '--no-progress',
+          '--extractor-args', ext,
+          ...(cookiesOk ? ['--cookies', COOKIES_PATH] : []),
+          ...(PROXY_URL ? ['--proxy', PROXY_URL] : []),
+          '--ffmpeg-location', FFMPEG,
+          '-N', '4',
+          '-f', FMT_AUDIO,
+          '-o', audioOriginalTpl,
+          url,
+        ], 'yt-dlp-audio');
+        // Procura arquivo baixado (extensao varia: m4a, webm, opus, etc)
+        try {
+          const f = fs.readdirSync(pasta).find(x => x.startsWith('audio_original.'));
+          if (r.codigo === 0 && f) {
+            const p = path.join(pasta, f);
+            if (fs.statSync(p).size > 50 * 1024) {
+              audioOriginal = p;
+              ok = true;
+              console.log('[cortador-analisar] audio baixado em', ((Date.now()-tDl0)/1000).toFixed(1), 's |', (fs.statSync(p).size/1024/1024).toFixed(1), 'MB |', ext);
+              break;
+            }
+          }
+        } catch (e) {}
+        ultimoErro = (r.stderr || r.stdout || '').slice(-300);
+        console.log('[cortador-analisar] tentativa falhou:', ultimoErro.slice(-150));
       }
+      if (!ok) {
+        limpar(pasta);
+        return res.status(500).json({
+          erro: 'Nao consegui baixar o audio desse video. Tenta com upload de arquivo.',
+          detalhe: ultimoErro
+        });
+      }
+      fullPath = audioOriginal;
     }
 
     // 2. Extrair audio leve pra mandar pro Groq
