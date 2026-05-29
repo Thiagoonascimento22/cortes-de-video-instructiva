@@ -410,7 +410,7 @@ ${texto}`;
 
     const req = https.request({
       hostname: 'generativelanguage.googleapis.com',
-      path: '/v1beta/models/gemini-2.0-flash:generateContent?key=' + GEMINI_API_KEY,
+      path: '/v1beta/models/gemini-2.5-flash:generateContent?key=' + GEMINI_API_KEY,
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -553,7 +553,7 @@ app.get('/', requireAuth, (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 56, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 57, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
 });
 
 // ============ ADMIN: atualizar cookies sem mexer no Railway ============
