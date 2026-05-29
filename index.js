@@ -210,7 +210,7 @@ app.get('/', (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 41, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 42, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, videosNoCache: videosCacheados });
 });
 
 // ============ ADMIN: atualizar cookies sem mexer no Railway ============
@@ -345,17 +345,20 @@ async function processarCorte(req, res) {
     } else {
       const t1 = Date.now();
       console.log('[cortador] CACHE MISS - baixando do YouTube | proxy:', PROXY_URL ? 'sim' : 'nao');
-      // Tenta varias estrategias de extractor em ordem, do mais robusto pro fallback
+      // Cada estrategia tenta combinacao de player_client + format diferente
+      // Se uma falha, proxima tem regras diferentes
       const estrategias = [
-        'youtube:player_client=mweb,tv_embedded,web_safari',
-        'youtube:player_client=ios,android',
-        'youtube:player_client=tv,web_safari,default',
+        { ext: 'youtube:player_client=mweb,tv_embedded,web_safari', fmt: 'bv*[height<=720]+ba/b[height<=720]/best' },
+        { ext: 'youtube:player_client=ios,android',                  fmt: 'best[height<=720]/best' },
+        { ext: 'youtube:player_client=tv,web_safari,default',        fmt: null }, // sem -f, yt-dlp escolhe
+        { ext: 'youtube:player_client=web,web_safari',               fmt: null },
+        { ext: 'youtube:player_client=mweb',                         fmt: 'best' },
       ];
       let r1 = null;
       for (let i = 0; i < estrategias.length; i++) {
-        const ext = estrategias[i];
-        console.log('[cortador] tentativa', i+1, 'de', estrategias.length, '| extractor:', ext);
-        r1 = await executar(YTDLP, [
+        const { ext, fmt } = estrategias[i];
+        console.log('[cortador] tentativa', i+1, 'de', estrategias.length, '| extractor:', ext, '| fmt:', fmt || 'auto');
+        const args = [
           '--no-playlist', '--no-warnings', '--no-progress',
           '--extractor-args', ext,
           ...(cookiesOk ? ['--cookies', COOKIES_PATH] : []),
@@ -363,11 +366,12 @@ async function processarCorte(req, res) {
           '--ffmpeg-location', FFMPEG,
           '-N', '4',
           '--retries', '2',
-          '-f', 'bv*[height<=720]+ba/b[height<=720]/bv*+ba/b',
+          ...(fmt ? ['-f', fmt] : []),
           '--merge-output-format', 'mp4',
           '-o', fullPath,
           url,
-        ], 'yt-dlp-download');
+        ];
+        r1 = await executar(YTDLP, args, 'yt-dlp-download');
         if (r1.codigo === 0 && fs.existsSync(fullPath)) {
           const stat = fs.statSync(fullPath);
           if (stat.size > 1024 * 1024) {
@@ -388,11 +392,14 @@ async function processarCorte(req, res) {
         try { if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath); } catch (e) {}
         limpar(pasta);
         const detalhe = (r1 && (r1.stderr || r1.stdout) || 'sem detalhes').slice(-700);
-        const ehBot = detalhe.includes("bot") || detalhe.includes("Sign in");
-        return res.status(500).json({
-          erro: ehBot ? 'YouTube bloqueou (bot check). Os cookies provavelmente expiraram - atualiza no Railway.' : 'Nao consegui baixar esse video. Confere o link.',
-          detalhe
-        });
+        const ehBot = /bot|sign in/i.test(detalhe);
+        const ehFormato = /format is not available|requested format/i.test(detalhe);
+        const ehPrivado = /private|members|sign in to view/i.test(detalhe);
+        let msg = 'Nao consegui baixar esse video. Confere o link.';
+        if (ehBot) msg = 'YouTube bloqueou (bot check). Os cookies provavelmente expiraram - atualiza em /admin.';
+        else if (ehPrivado) msg = 'Esse video e privado ou so pra membros. Nao da pra baixar.';
+        else if (ehFormato) msg = 'Esse video tem restricao especial do YouTube (provavel live, age-gate ou DRM). Tenta outro link, ou baixa pelo Cobalt.tools e usa o upload de arquivo aqui.';
+        return res.status(500).json({ erro: msg, detalhe });
       }
     }
     } // fim else do isUpload
