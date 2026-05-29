@@ -376,7 +376,7 @@ app.get('/', requireAuth, (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 52, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 53, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
 });
 
 // ============ ADMIN: atualizar cookies sem mexer no Railway ============
@@ -543,11 +543,12 @@ async function processarCorte(req, res) {
       // TENTATIVA 1: yt-dlp PRIMEIRO em 1080p forcado (melhor qualidade)
       let r1 = null;
       let ytdlpOk = false;
+      const FMT_HQ = 'bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/best';
       const estrategias = [
-        { ext: 'youtube:player_client=tv,web_safari',                fmt: 'bv*[height<=1080]+ba/b[height<=1080]/best' },
-        { ext: 'youtube:player_client=web_safari,default',           fmt: 'bv*[height<=1080]+ba/b[height<=1080]/best' },
-        { ext: 'youtube:player_client=ios',                          fmt: 'bv*[height<=1080]+ba/b[height<=1080]/best' },
-        { ext: 'youtube:player_client=tv_embedded,android',          fmt: 'bv*[height<=1080]+ba/b[height<=1080]/best' },
+        { ext: 'youtube:player_client=tv,web_safari',                fmt: FMT_HQ },
+        { ext: 'youtube:player_client=web_safari,default',           fmt: FMT_HQ },
+        { ext: 'youtube:player_client=ios',                          fmt: FMT_HQ },
+        { ext: 'youtube:player_client=tv_embedded,android',          fmt: FMT_HQ },
         { ext: 'youtube:player_client=mweb',                         fmt: 'best' },
       ];
       for (let i = 0; i < estrategias.length; i++) {
@@ -568,28 +569,17 @@ async function processarCorte(req, res) {
         ];
         r1 = await executar(YTDLP, args, 'yt-dlp-download');
         if (r1.codigo === 0 && fs.existsSync(fullPath) && fs.statSync(fullPath).size > 1024 * 1024) {
-          // Validar resolucao real do arquivo
+          // Loga a resolucao baixada (so info, nao descarta)
           try {
             const probe = await executar(FFMPEG, ['-i', fullPath, '-hide_banner'], 'ffprobe-check');
             const stderr = probe.stderr || '';
             const m = stderr.match(/Video:[^,]+,[^,]+,\s*(\d+)x(\d+)/);
-            const altura = m ? parseInt(m[2]) : 0;
             const mb = (fs.statSync(fullPath).size/1024/1024).toFixed(1);
-            console.log('[cortador] tentativa', i+1, ': baixou', mb, 'MB |', m ? `${m[1]}x${m[2]}` : 'sem info', '|', altura, 'px');
-            if (altura >= 720) {
-              console.log('[cortador] yt-dlp OK na tentativa', i+1, '(qualidade boa)');
-              ytdlpOk = true;
-              break;
-            } else {
-              console.log('[cortador] qualidade baixa (', altura, 'px), descartando e tentando proxima estrategia');
-              try { fs.unlinkSync(fullPath); } catch (e) {}
-              continue;
-            }
-          } catch (e) {
-            console.log('[cortador] ffprobe falhou, mas arquivo OK, usando');
-            ytdlpOk = true;
-            break;
-          }
+            console.log('[cortador] tentativa', i+1, ': baixou', mb, 'MB |', m ? `${m[1]}x${m[2]}` : 'sem info');
+          } catch (e) {}
+          console.log('[cortador] yt-dlp OK na tentativa', i+1);
+          ytdlpOk = true;
+          break;
         }
         try { if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath); } catch (e) {}
       }
