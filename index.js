@@ -210,7 +210,7 @@ app.get('/', (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 40, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 41, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, videosNoCache: videosCacheados });
 });
 
 // ============ ADMIN: atualizar cookies sem mexer no Railway ============
@@ -363,7 +363,7 @@ async function processarCorte(req, res) {
           '--ffmpeg-location', FFMPEG,
           '-N', '4',
           '--retries', '2',
-          '-f', 'bv*[vcodec^=avc1][height<=720][fps<=30]+ba[ext=m4a]/bv*[vcodec^=avc1][height<=720]+ba[ext=m4a]/b[ext=mp4][height<=720]/b[ext=mp4]/b',
+          '-f', 'bv*[height<=720]+ba/b[height<=720]/bv*+ba/b',
           '--merge-output-format', 'mp4',
           '-o', fullPath,
           url,
