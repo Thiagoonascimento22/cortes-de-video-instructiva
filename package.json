@@ -1,14 +1,15 @@
 {
-  "name": "cortador",
+  "name": "cortador-clara",
   "version": "1.0.0",
-  "description": "Corta um trecho de um video do YouTube",
+  "type": "commonjs",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "adm-zip": "^0.5.17",
+    "adm-zip": "^0.5.16",
     "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1"
   }
 }
