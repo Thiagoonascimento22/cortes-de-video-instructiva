@@ -167,66 +167,95 @@ function garantirLogo() {
 }
 garantirLogo();
 
-// ---- Cobalt.tools API (fallback quando yt-dlp falha no YouTube) ----
-// Open-source, sem bot detection, sem chave necessaria
+// ---- Cobalt.tools API (PRIMEIRA TENTATIVA) ----
+// URL da instancia propria do Cobalt (hospedada no Railway pela Instructiva)
+// Pode ser sobrescrita via env var COBALT_API_URL no Railway
+const COBALT_API_URL = (process.env.COBALT_API_URL || 'https://cobalt-production-2fb0.up.railway.app').replace(/\/+$/, '');
+
 function baixarViaCobalt(videoUrl, destPath) {
   return new Promise((resolve, reject) => {
+    if (!COBALT_API_URL) return reject(new Error('COBALT_API_URL nao configurada'));
     const body = JSON.stringify({
       url: videoUrl,
       videoQuality: '720',
       filenameStyle: 'basic',
       downloadMode: 'auto'
     });
+    const u = new URL(COBALT_API_URL + '/');
     const req = https.request({
-      hostname: 'api.cobalt.tools',
+      hostname: u.hostname,
+      port: u.port || 443,
       path: '/',
       method: 'POST',
       headers: {
         'Accept': 'application/json',
         'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0',
+        'User-Agent': 'cortador-instructiva/1.0',
         'Content-Length': Buffer.byteLength(body),
       },
-      timeout: 30000,
+      timeout: 45000,
     }, (r) => {
       let data = '';
       r.on('data', chunk => { data += chunk; });
       r.on('end', () => {
         try {
           const j = JSON.parse(data);
-          console.log('[cortador] cobalt response status:', j.status);
+          console.log('[cortador] cobalt status:', j.status, '| http:', r.statusCode);
           if ((j.status === 'tunnel' || j.status === 'redirect' || j.status === 'stream') && j.url) {
-            // Baixa o video da URL temporaria que o Cobalt devolveu
+            // Cobalt retornou URL de download. Baixa o arquivo.
             const baixarArq = (url, redirs) => {
-              if ((redirs || 0) > 5) return reject(new Error('Muitos redirects'));
-              https.get(url, (resp) => {
+              if ((redirs || 0) > 5) return reject(new Error('Muitos redirects no download'));
+              const downloadUrl = new URL(url);
+              const proto = downloadUrl.protocol === 'http:' ? require('http') : https;
+              proto.get(url, (resp) => {
                 if (resp.statusCode >= 300 && resp.statusCode < 400 && resp.headers.location) {
                   return baixarArq(resp.headers.location, (redirs || 0) + 1);
                 }
-                if (resp.statusCode !== 200) return reject(new Error('Erro baixando do Cobalt: HTTP ' + resp.statusCode));
+                if (resp.statusCode !== 200) return reject(new Error('HTTP ' + resp.statusCode + ' baixando do tunnel'));
                 const out = fs.createWriteStream(destPath);
                 resp.pipe(out);
                 out.on('finish', () => out.close(() => {
                   const sz = fs.statSync(destPath).size;
-                  console.log('[cortador] cobalt download OK:', (sz/1024/1024).toFixed(1), 'MB');
+                  console.log('[cortador] cobalt OK:', (sz/1024/1024).toFixed(1), 'MB');
                   resolve();
                 }));
                 out.on('error', reject);
               }).on('error', reject);
             };
             baixarArq(j.url);
+          } else if (j.status === 'picker' && j.picker && j.picker.length > 0) {
+            // Cobalt deu varias opcoes - pega primeira
+            const primeira = j.picker[0];
+            if (primeira.url) {
+              const baixarPicker = (url) => {
+                https.get(url, (resp) => {
+                  if (resp.statusCode >= 300 && resp.statusCode < 400 && resp.headers.location) {
+                    return baixarPicker(resp.headers.location);
+                  }
+                  if (resp.statusCode !== 200) return reject(new Error('HTTP ' + resp.statusCode));
+                  const out = fs.createWriteStream(destPath);
+                  resp.pipe(out);
+                  out.on('finish', () => out.close(() => resolve()));
+                  out.on('error', reject);
+                }).on('error', reject);
+              };
+              baixarPicker(primeira.url);
+            } else {
+              reject(new Error('Picker sem URL valida'));
+            }
           } else if (j.status === 'error') {
-            reject(new Error('Cobalt error: ' + (j.error && j.error.code || j.text || 'desconhecido')));
+            const code = (j.error && j.error.code) || 'desconhecido';
+            reject(new Error('Cobalt: ' + code));
           } else {
-            reject(new Error('Cobalt resposta inesperada: ' + j.status));
+            reject(new Error('Resposta Cobalt inesperada: ' + (j.status || JSON.stringify(j).slice(0, 200))));
           }
         } catch (e) {
-          reject(new Error('Cobalt resposta invalida: ' + data.slice(0, 200)));
+          reject(new Error('Resposta Cobalt invalida (' + r.statusCode + '): ' + data.slice(0, 200)));
         }
       });
     });
     req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Cobalt timeout (30s)')); });
+    req.on('timeout', () => { req.destroy(); reject(new Error('Cobalt timeout (45s)')); });
     req.write(body);
     req.end();
   });
@@ -275,7 +304,7 @@ app.get('/', (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 45, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 46, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
 });
 
 // ============ ADMIN: atualizar cookies sem mexer no Railway ============
@@ -433,65 +462,76 @@ async function processarCorte(req, res) {
     if (cacheHit) {
       console.log('[cortador] CACHE HIT - usando video ja baixado:', path.basename(fullPath));
     } else {
-      const t1 = Date.now();
-      console.log('[cortador] CACHE MISS - baixando do YouTube | proxy:', PROXY_URL ? 'sim' : 'nao');
-      // Cada estrategia tenta combinacao de player_client + format diferente
-      // Se uma falha, proxima tem regras diferentes
-      const estrategias = [
-        { ext: 'youtube:player_client=mweb,tv_embedded,web_safari', fmt: 'bv*[height<=720]+ba/b[height<=720]/best' },
-        { ext: 'youtube:player_client=ios,android',                  fmt: 'best[height<=720]/best' },
-        { ext: 'youtube:player_client=tv,web_safari,default',        fmt: null }, // sem -f, yt-dlp escolhe
-        { ext: 'youtube:player_client=web,web_safari',               fmt: null },
-        { ext: 'youtube:player_client=mweb',                         fmt: 'best' },
-      ];
-      let r1 = null;
-      for (let i = 0; i < estrategias.length; i++) {
-        const { ext, fmt } = estrategias[i];
-        console.log('[cortador] tentativa', i+1, 'de', estrategias.length, '| extractor:', ext, '| fmt:', fmt || 'auto');
-        const args = [
-          '--no-playlist', '--no-warnings', '--no-progress',
-          '--extractor-args', ext,
-          ...(cookiesOk ? ['--cookies', COOKIES_PATH] : []),
-          ...(PROXY_URL ? ['--proxy', PROXY_URL] : []),
-          '--ffmpeg-location', FFMPEG,
-          '-N', '4',
-          '--retries', '2',
-          ...(fmt ? ['-f', fmt] : []),
-          '--merge-output-format', 'mp4',
-          '-o', fullPath,
-          url,
-        ];
-        r1 = await executar(YTDLP, args, 'yt-dlp-download');
-        if (r1.codigo === 0 && fs.existsSync(fullPath)) {
-          const stat = fs.statSync(fullPath);
-          if (stat.size > 1024 * 1024) {
-            console.log('[cortador] download OK na tentativa', i+1, '|', (stat.size/1024/1024).toFixed(1), 'MB');
-            break;
+      const tDownload = Date.now();
+      console.log('[cortador] CACHE MISS - tentando Cobalt primeiro |', COBALT_API_URL);
+
+      let cobaltErro = null;
+      let cobaltOk = false;
+
+      // TENTATIVA 1: Cobalt proprio (rapido, confiavel)
+      if (COBALT_API_URL) {
+        try {
+          await baixarViaCobalt(url, fullPath);
+          if (fs.existsSync(fullPath) && fs.statSync(fullPath).size > 1024 * 1024) {
+            cobaltOk = true;
+            console.log('[cortador] Cobalt baixou em', ((Date.now()-tDownload)/1000).toFixed(1), 's');
+          } else {
+            throw new Error('arquivo muito pequeno');
           }
-        }
-        // limpa arquivo parcial antes do retry
-        try { if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath); } catch (e) {}
-        if (i < estrategias.length - 1) {
-          console.log('[cortador] tentativa', i+1, 'falhou, tentando proxima...');
+        } catch (e) {
+          cobaltErro = e.message;
+          console.log('[cortador] Cobalt falhou:', e.message, '- tentando yt-dlp como fallback...');
+          try { if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath); } catch (e2) {}
         }
       }
-      const dt1 = ((Date.now() - t1) / 1000).toFixed(1);
-      console.log('[cortador] yt-dlp levou', dt1, 's');
 
-      const ytdlpFalhou = !r1 || r1.codigo !== 0 || !fs.existsSync(fullPath) || (fs.existsSync(fullPath) && fs.statSync(fullPath).size <= 1024 * 1024);
-      if (ytdlpFalhou) {
+      // TENTATIVA 2: yt-dlp como fallback (5 estrategias)
+      let r1 = null;
+      if (!cobaltOk) {
+        const estrategias = [
+          { ext: 'youtube:player_client=mweb,tv_embedded,web_safari', fmt: 'bv*[height<=720]+ba/b[height<=720]/best' },
+          { ext: 'youtube:player_client=ios,android',                  fmt: 'best[height<=720]/best' },
+          { ext: 'youtube:player_client=tv,web_safari,default',        fmt: null },
+          { ext: 'youtube:player_client=web,web_safari',               fmt: null },
+          { ext: 'youtube:player_client=mweb',                         fmt: 'best' },
+        ];
+        for (let i = 0; i < estrategias.length; i++) {
+          const { ext, fmt } = estrategias[i];
+          console.log('[cortador] yt-dlp tentativa', i+1, '| extractor:', ext, '| fmt:', fmt || 'auto');
+          const args = [
+            '--no-playlist', '--no-warnings', '--no-progress',
+            '--extractor-args', ext,
+            ...(cookiesOk ? ['--cookies', COOKIES_PATH] : []),
+            ...(PROXY_URL ? ['--proxy', PROXY_URL] : []),
+            '--ffmpeg-location', FFMPEG,
+            '-N', '4',
+            '--retries', '2',
+            ...(fmt ? ['-f', fmt] : []),
+            '--merge-output-format', 'mp4',
+            '-o', fullPath,
+            url,
+          ];
+          r1 = await executar(YTDLP, args, 'yt-dlp-download');
+          if (r1.codigo === 0 && fs.existsSync(fullPath) && fs.statSync(fullPath).size > 1024 * 1024) {
+            console.log('[cortador] yt-dlp OK na tentativa', i+1);
+            break;
+          }
+          try { if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath); } catch (e) {}
+        }
+      }
+
+      const dt1 = ((Date.now() - tDownload) / 1000).toFixed(1);
+      console.log('[cortador] download total levou', dt1, 's | cobaltOk:', cobaltOk);
+
+      if (!fs.existsSync(fullPath) || fs.statSync(fullPath).size <= 1024 * 1024) {
         try { if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath); } catch (e) {}
         limpar(pasta);
-        const detalheYtdlp = (r1 && (r1.stderr || r1.stdout) || '').slice(-500);
-        const ehBot = /bot|sign in/i.test(detalheYtdlp);
-        const ehPrivado = /private|members|sign in to view/i.test(detalheYtdlp);
-        const ehFormato = /format is not available|requested format/i.test(detalheYtdlp);
-        let msg = 'Nao consegui baixar esse video.';
-        if (ehBot) msg = 'YouTube bloqueou (bot check). Atualiza cookies em /admin.';
-        else if (ehPrivado) msg = 'Esse video e privado ou so pra membros.';
-        else if (ehFormato) msg = 'YouTube nao liberou os formatos desse video (pode ser rate-limit temporario ou protecao). Solucao rapida: baixa pelo Cobalt.tools e usa o botao "Arquivo".';
-        else msg = 'Falha no download. Solucao rapida: baixa pelo Cobalt.tools e usa o botao "Arquivo".';
-        return res.status(500).json({ erro: msg, detalhe: detalheYtdlp });
+        const detalheYtdlp = (r1 && (r1.stderr || r1.stdout) || 'nao tentado').slice(-400);
+        const detalhe = `cobalt: ${cobaltErro || 'nao tentado'}\n\nyt-dlp: ${detalheYtdlp}`;
+        return res.status(500).json({
+          erro: 'Nao consegui baixar esse video por nenhum metodo. Tenta upload de arquivo.',
+          detalhe
+        });
       }
     }
     } // fim else do isUpload
