@@ -615,6 +615,61 @@ function cachePathPara(url, ext) {
   return path.join(CACHE_DIR, hash + '.' + (ext || 'mp4'));
 }
 
+// Cache de trecho específico (so o pedaço do video, baixado com --download-sections)
+function cacheTrechoPath(url, si, sf) {
+  const key = url + '|' + Math.floor(si) + '|' + Math.floor(sf);
+  const hash = crypto.createHash('md5').update(key).digest('hex');
+  return path.join(CACHE_DIR, 'trecho_' + hash + '.mp4');
+}
+
+function segParaHMS(s) {
+  const h = Math.floor(s/3600);
+  const m = Math.floor((s%3600)/60);
+  const sec = Math.floor(s%60);
+  return String(h).padStart(2,'0') + ':' + String(m).padStart(2,'0') + ':' + String(sec).padStart(2,'0');
+}
+
+// Baixa APENAS um trecho do YouTube usando --download-sections (rapido!)
+async function baixarTrechoYoutube(url, si, sf, destPath) {
+  fs.mkdirSync(path.dirname(destPath), { recursive: true });
+  const FMT = 'bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/best';
+  const estrategias = [
+    'youtube:player_client=tv,web_safari',
+    'youtube:player_client=web_safari,default',
+    'youtube:player_client=ios',
+    'youtube:player_client=tv_embedded,android',
+  ];
+  // Pega ~2s antes e depois pra garantir keyframes
+  const siCom = Math.max(0, si - 2);
+  const sfCom = sf + 2;
+  const secao = '*' + segParaHMS(siCom) + '-' + segParaHMS(sfCom);
+  let ultimoErro = '';
+  for (const ext of estrategias) {
+    console.log('[cortador] baixando trecho', segParaHMS(si), '->', segParaHMS(sf), '| extractor:', ext);
+    try { if (fs.existsSync(destPath)) fs.unlinkSync(destPath); } catch (e) {}
+    const r = await executar(YTDLP, [
+      '--no-playlist', '--no-warnings', '--no-progress',
+      '--extractor-args', ext,
+      ...(cookiesOk ? ['--cookies', COOKIES_PATH] : []),
+      ...(PROXY_URL ? ['--proxy', PROXY_URL] : []),
+      '--ffmpeg-location', FFMPEG,
+      '-N', '4',
+      '--download-sections', secao,
+      '-f', FMT,
+      '--merge-output-format', 'mp4',
+      '-o', destPath,
+      url,
+    ], 'yt-dlp-trecho');
+    if (r.codigo === 0 && fs.existsSync(destPath) && fs.statSync(destPath).size > 100 * 1024) {
+      console.log('[cortador] trecho baixado:', (fs.statSync(destPath).size/1024/1024).toFixed(1), 'MB');
+      return true;
+    }
+    ultimoErro = (r.stderr || r.stdout || '').slice(-200);
+  }
+  console.log('[cortador] falhou baixar trecho:', ultimoErro);
+  return false;
+}
+
 function limparCacheAntigo() {
   try {
     if (!fs.existsSync(CACHE_DIR)) return;
@@ -715,7 +770,7 @@ app.get('/', requireAuth, (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 67, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 68, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
 });
 
 // ============ ADMIN: atualizar cookies sem mexer no Railway ============
@@ -869,6 +924,7 @@ async function processarCorte(req, res) {
     const duracao = temTempos ? (sf - si) : 0;
     let fullPath;
     let cacheHit = false;
+    let ehTrecho = false; // se o arquivo de origem ja é so o trecho (baixado com --download-sections)
 
     if (isUpload) {
       fullPath = req.file.path;
@@ -884,6 +940,34 @@ async function processarCorte(req, res) {
 
     if (cacheHit) {
       console.log('[cortador] CACHE HIT - usando video ja baixado:', path.basename(fullPath));
+    } else {
+      // PRIORIDADE 0: se tem tempos, tenta baixar SO o trecho (5-15s)
+      if (temTempos) {
+        const trechoPath = cacheTrechoPath(url, si, sf);
+        if (fs.existsSync(trechoPath) && fs.statSync(trechoPath).size > 100 * 1024) {
+          console.log('[cortador] usando TRECHO ja em cache:', path.basename(trechoPath), '(' + (fs.statSync(trechoPath).size/1024/1024).toFixed(1) + ' MB)');
+          fullPath = trechoPath;
+          ehTrecho = true;
+          cacheHit = true;
+        } else {
+          console.log('[cortador] tentando baixar APENAS o trecho (rapido)...');
+          const tTrecho = Date.now();
+          const ok = await baixarTrechoYoutube(url, si, sf, trechoPath);
+          if (ok) {
+            console.log('[cortador] trecho baixado em', ((Date.now()-tTrecho)/1000).toFixed(1), 's');
+            fullPath = trechoPath;
+            ehTrecho = true;
+            cacheHit = true; // tratamos como cache hit pra pular o resto
+          } else {
+            console.log('[cortador] trecho falhou, vai cair pro download completo');
+            fullPath = cachePathPara(url, 'mp4'); // restaura path de video completo
+          }
+        }
+      }
+    }
+
+    if (cacheHit) {
+      // Pula o resto do download
     } else {
       const tDownload = Date.now();
       console.log('[cortador] CACHE MISS - tentando Cobalt primeiro |', COBALT_API_URL);
@@ -994,7 +1078,7 @@ async function processarCorte(req, res) {
       // -c copy: cut rapido sem reencode (segundos)
       cutArgs = [
         '-y',
-        ...(temTempos ? ['-ss', String(si)] : []),
+        ...(temTempos ? ['-ss', String(ehTrecho ? 2 : si)] : []),
         '-i', fullPath,
         ...(temTempos ? ['-t', String(duracao)] : []),
         '-c', 'copy',
@@ -1100,7 +1184,7 @@ Dialogue: 0,0:00:00.00,9:00:00.00,Default,,0,0,0,,${textoUp}
         const filterComplex = `[0:v]${filtroV}[vmain];[1:v]scale=${wmSize}:${wmSize}[wm];[vmain][wm]overlay=W-w-${wmMargin}:H-h-${wmMargin}[vout]`;
         cutArgs = [
           '-y',
-          ...(temTempos ? ['-ss', String(si)] : []),
+          ...(temTempos ? ['-ss', String(ehTrecho ? 2 : si)] : []),
           '-i', fullPath,
           '-i', LOGO_PATH,
           ...(temTempos ? ['-t', String(duracao)] : []),
@@ -1121,7 +1205,7 @@ Dialogue: 0,0:00:00.00,9:00:00.00,Default,,0,0,0,,${textoUp}
       } else {
         cutArgs = [
           '-y',
-          ...(temTempos ? ['-ss', String(si)] : []),
+          ...(temTempos ? ['-ss', String(ehTrecho ? 2 : si)] : []),
           '-i', fullPath,
           ...(temTempos ? ['-t', String(duracao)] : []),
           '-vf', filtroV,
@@ -1335,62 +1419,39 @@ app.post('/preview', requireAuth, async (req, res) => {
   if (isNaN(si) || isNaN(sf) || sf <= si) return res.status(400).json({ erro: 'Fim precisa ser depois do inicio.' });
   if (sf - si > MAX_SEGUNDOS) return res.status(400).json({ erro: 'Trecho muito longo.' });
 
-  // Acha o arquivo de origem (cache do url OR upload preservado)
+  // Acha o arquivo de origem
   let fullPath = null;
+  let ehTrecho = false; // se já é só o trecho, não precisa cortar de novo
   if (arquivoUploadId && /^[a-zA-Z0-9._-]+$/.test(arquivoUploadId)) {
     const p = path.join(UPLOAD_DIR, arquivoUploadId);
     if (fs.existsSync(p)) fullPath = p;
   } else if (url) {
-    const cached = cachePathPara(url, 'mp4');
-    if (fs.existsSync(cached) && fs.statSync(cached).size > 1024 * 1024) fullPath = cached;
-  }
-
-  // Se nao tem cache, baixa rapido pra que o preview funcione
-  if (!fullPath && url) {
-    console.log('[cortador-preview] cache vazio, baixando video pela primeira vez...');
-    try {
-      await garantirYtdlp();
-      await garantirFfmpeg();
-      fs.mkdirSync(CACHE_DIR, { recursive: true });
-      const tempDl = cachePathPara(url, 'mp4');
-      const FMT_HQ = 'bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/best';
-      const estrategias = [
-        'youtube:player_client=tv,web_safari',
-        'youtube:player_client=web_safari,default',
-        'youtube:player_client=ios',
-        'youtube:player_client=tv_embedded,android',
-      ];
-      let dlOk = false;
-      for (const ext of estrategias) {
-        const r = await executar(YTDLP, [
-          '--no-playlist', '--no-warnings', '--no-progress',
-          '--extractor-args', ext,
-          ...(cookiesOk ? ['--cookies', COOKIES_PATH] : []),
-          ...(PROXY_URL ? ['--proxy', PROXY_URL] : []),
-          '--ffmpeg-location', FFMPEG,
-          '-N', '4',
-          '-f', FMT_HQ,
-          '--merge-output-format', 'mp4',
-          '-o', tempDl,
-          url,
-        ], 'yt-dlp-preview');
-        if (r.codigo === 0 && fs.existsSync(tempDl) && fs.statSync(tempDl).size > 1024 * 1024) {
-          dlOk = true;
-          break;
-        }
-        try { if (fs.existsSync(tempDl)) fs.unlinkSync(tempDl); } catch (e) {}
-      }
-      if (!dlOk && COBALT_API_URL) {
+    // 1) Vídeo completo em cache?
+    const cachedFull = cachePathPara(url, 'mp4');
+    if (fs.existsSync(cachedFull) && fs.statSync(cachedFull).size > 1024 * 1024) {
+      fullPath = cachedFull;
+    } else {
+      // 2) Trecho específico em cache?
+      const cachedTrecho = cacheTrechoPath(url, si, sf);
+      if (fs.existsSync(cachedTrecho) && fs.statSync(cachedTrecho).size > 50 * 1024) {
+        fullPath = cachedTrecho;
+        ehTrecho = true;
+        console.log('[cortador-preview] trecho ja em cache:', path.basename(cachedTrecho));
+      } else {
+        // 3) Baixa APENAS o trecho (rapido!)
+        console.log('[cortador-preview] baixando trecho do YouTube...');
         try {
-          await baixarViaCobalt(url, tempDl);
-          if (fs.existsSync(tempDl) && fs.statSync(tempDl).size > 1024 * 1024) dlOk = true;
-        } catch (e) {}
+          await garantirYtdlp();
+          await garantirFfmpeg();
+          fs.mkdirSync(CACHE_DIR, { recursive: true });
+          const ok = await baixarTrechoYoutube(url, si, sf, cachedTrecho);
+          if (ok) {
+            fullPath = cachedTrecho;
+            ehTrecho = true;
+          }
+        } catch (e) { console.log('[cortador-preview] erro:', e.message); }
       }
-      if (dlOk) {
-        fullPath = tempDl;
-        console.log('[cortador-preview] video baixado e cacheado:', (fs.statSync(tempDl).size/1024/1024).toFixed(1), 'MB');
-      }
-    } catch (e) { console.log('[cortador-preview] erro baixando:', e.message); }
+    }
   }
 
   if (!fullPath) {
@@ -1403,11 +1464,16 @@ app.post('/preview', requireAuth, async (req, res) => {
     pasta = fs.mkdtempSync(path.join(os.tmpdir(), 'preview-'));
     const previewPath = path.join(pasta, 'preview.mp4');
 
+    // Se já é trecho (baixado com --download-sections), o -ss baseline é 0
+    // Senão usa o tempo original (si)
+    const ssReal = ehTrecho ? Math.max(0, si - (si - 2)) : si; // se ehTrecho, comeca em ~2s (margem de keyframes)
+    const ssParam = ehTrecho ? Math.max(0, 2) : si;
+
     // Tenta corte rapido com -c copy (1-3s, sem reencode)
     const t0 = Date.now();
     const r = await executar(FFMPEG, [
       '-y',
-      '-ss', String(si),
+      '-ss', String(ssParam),
       '-i', fullPath,
       '-t', String(sf - si),
       '-c', 'copy',
@@ -1424,7 +1490,7 @@ app.post('/preview', requireAuth, async (req, res) => {
       try { if (fs.existsSync(previewPath)) fs.unlinkSync(previewPath); } catch (e) {}
       const r2 = await executar(FFMPEG, [
         '-y',
-        '-ss', String(si),
+        '-ss', String(ssParam),
         '-i', fullPath,
         '-t', String(sf - si),
         '-c:v', 'libx264',
