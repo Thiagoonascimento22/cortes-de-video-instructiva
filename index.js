@@ -652,7 +652,7 @@ app.get('/', requireAuth, (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 63, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 64, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
 });
 
 // ============ ADMIN: atualizar cookies sem mexer no Railway ============
@@ -1191,7 +1191,11 @@ app.post('/analisar', requireAuth, upload.single('arquivo'), async (req, res) =>
             detalhe: 'yt-dlp: ' + ultimoErro + '\n\ncobalt: ' + cobaltErro
           });
         }
-        try { fs.copyFileSync(videoPath, cachePath); } catch (e) {}
+        try {
+          fs.mkdirSync(CACHE_DIR, { recursive: true });
+          fs.copyFileSync(videoPath, cachePath);
+          console.log('[cortador-analisar] video salvo no cache:', path.basename(cachePath), '|', (fs.statSync(cachePath).size/1024/1024).toFixed(1), 'MB');
+        } catch (e) { console.log('[cortador-analisar] ERRO copiando video pro cache:', e.message); }
         fullPath = videoPath;
       }
     }
@@ -1289,8 +1293,56 @@ app.post('/preview', requireAuth, async (req, res) => {
     if (fs.existsSync(cached) && fs.statSync(cached).size > 1024 * 1024) fullPath = cached;
   }
 
+  // Se nao tem cache, baixa rapido pra que o preview funcione
+  if (!fullPath && url) {
+    console.log('[cortador-preview] cache vazio, baixando video pela primeira vez...');
+    try {
+      await garantirYtdlp();
+      await garantirFfmpeg();
+      fs.mkdirSync(CACHE_DIR, { recursive: true });
+      const tempDl = cachePathPara(url, 'mp4');
+      const FMT_HQ = 'bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/best';
+      const estrategias = [
+        'youtube:player_client=tv,web_safari',
+        'youtube:player_client=web_safari,default',
+        'youtube:player_client=ios',
+        'youtube:player_client=tv_embedded,android',
+      ];
+      let dlOk = false;
+      for (const ext of estrategias) {
+        const r = await executar(YTDLP, [
+          '--no-playlist', '--no-warnings', '--no-progress',
+          '--extractor-args', ext,
+          ...(cookiesOk ? ['--cookies', COOKIES_PATH] : []),
+          ...(PROXY_URL ? ['--proxy', PROXY_URL] : []),
+          '--ffmpeg-location', FFMPEG,
+          '-N', '4',
+          '-f', FMT_HQ,
+          '--merge-output-format', 'mp4',
+          '-o', tempDl,
+          url,
+        ], 'yt-dlp-preview');
+        if (r.codigo === 0 && fs.existsSync(tempDl) && fs.statSync(tempDl).size > 1024 * 1024) {
+          dlOk = true;
+          break;
+        }
+        try { if (fs.existsSync(tempDl)) fs.unlinkSync(tempDl); } catch (e) {}
+      }
+      if (!dlOk && COBALT_API_URL) {
+        try {
+          await baixarViaCobalt(url, tempDl);
+          if (fs.existsSync(tempDl) && fs.statSync(tempDl).size > 1024 * 1024) dlOk = true;
+        } catch (e) {}
+      }
+      if (dlOk) {
+        fullPath = tempDl;
+        console.log('[cortador-preview] video baixado e cacheado:', (fs.statSync(tempDl).size/1024/1024).toFixed(1), 'MB');
+      }
+    } catch (e) { console.log('[cortador-preview] erro baixando:', e.message); }
+  }
+
   if (!fullPath) {
-    return res.status(404).json({ erro: 'Video nao esta em cache. Roda a analise da IA primeiro (ou aguarda o cortar baixar uma vez).' });
+    return res.status(404).json({ erro: 'Nao consegui acessar o video pra fazer preview.' });
   }
 
   let pasta;
