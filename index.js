@@ -19,7 +19,7 @@ app.use(express.json());
 
 const YTDLP = path.join(os.tmpdir(), 'yt-dlp_bin');
 const YTDLP_URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
-const MAX_SEGUNDOS = 15 * 60;
+const MAX_SEGUNDOS = 60 * 60;
 
 // Cookies do YouTube (vêm da variável privada YOUTUBE_COOKIES do Railway)
 const COOKIES_PATH = path.join(os.tmpdir(), 'yt-cookies.txt');
@@ -156,7 +156,7 @@ app.get('/', (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 28, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 29, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, videosNoCache: videosCacheados });
 });
 
 // Helper: roda um comando e retorna {codigo, sinal, stdout, stderr}
@@ -189,7 +189,7 @@ app.post('/cortar', async (req, res) => {
 
   const si = paraSegundos(inicio), sf = paraSegundos(fim);
   if (isNaN(si) || isNaN(sf) || sf <= si) return res.status(400).json({ erro: 'O fim precisa ser depois do inicio.' });
-  if (sf - si > MAX_SEGUNDOS) return res.status(400).json({ erro: 'O corte ta muito longo (maximo 15 minutos por vez).' });
+  if (sf - si > MAX_SEGUNDOS) return res.status(400).json({ erro: 'O corte ta muito longo (maximo 60 minutos por vez).' });
 
   let pasta;
   try {
