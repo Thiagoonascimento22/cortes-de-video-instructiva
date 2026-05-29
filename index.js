@@ -179,9 +179,11 @@ function baixarViaCobalt(videoUrl, destPath) {
     if (!COBALT_API_URL) return reject(new Error('COBALT_API_URL nao configurada'));
     const body = JSON.stringify({
       url: videoUrl,
-      videoQuality: '1080',
+      videoQuality: 'max',
+      audioBitrate: '256',
       filenameStyle: 'basic',
-      downloadMode: 'auto'
+      downloadMode: 'auto',
+      youtubeVideoCodec: 'h264'
     });
     const u = new URL(COBALT_API_URL + '/');
     const req = https.request({
@@ -373,7 +375,7 @@ app.get('/', requireAuth, (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 48, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 49, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
 });
 
 // ============ ADMIN: atualizar cookies sem mexer no Railway ============
@@ -673,10 +675,13 @@ Dialogue: 0,0:00:00.00,9:00:00.00,Default,,0,0,0,,${textoUp}
           '-map', '[vout]',
           '-map', '0:a?',
           '-c:v', 'libx264',
-          '-preset', 'fast',
-          '-crf', '20',
+          '-preset', 'medium',
+          '-crf', '18',
+          '-tune', 'film',
+          '-pix_fmt', 'yuv420p',
+          '-profile:v', 'high',
           '-c:a', 'aac',
-          '-b:a', '192k',
+          '-b:a', '256k',
           '-movflags', '+faststart',
           cortePath,
         ];
@@ -688,10 +693,13 @@ Dialogue: 0,0:00:00.00,9:00:00.00,Default,,0,0,0,,${textoUp}
           ...(temTempos ? ['-t', String(duracao)] : []),
           '-vf', filtroV,
           '-c:v', 'libx264',
-          '-preset', 'fast',
-          '-crf', '20',
+          '-preset', 'medium',
+          '-crf', '18',
+          '-tune', 'film',
+          '-pix_fmt', 'yuv420p',
+          '-profile:v', 'high',
           '-c:a', 'aac',
-          '-b:a', '192k',
+          '-b:a', '256k',
           '-movflags', '+faststart',
           cortePath,
         ];
