@@ -179,7 +179,7 @@ app.get('/', (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 30, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 31, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, videosNoCache: videosCacheados });
 });
 
 // Helper: roda um comando e retorna {codigo, sinal, stdout, stderr}
@@ -282,10 +282,29 @@ app.post('/cortar', async (req, res) => {
         // Crop central, zoom no meio
         filtroV = 'crop=ih*9/16:ih,scale=720:1280';
       } else { // talking_texto
-        // Crop + texto burnado na parte inferior (Anton font, branco, fundo preto translucido)
-        // Escape do texto pra drawtext: ' \ , ; : etc precisam de escape
-        const textoSafe = texto.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/:/g, '\\:').replace(/%/g, '\\%').replace(/,/g, '\\,').toUpperCase() || 'INSTRUCTIVA';
-        filtroV = `crop=ih*9/16:ih,scale=720:1280,drawtext=fontfile='${FONTE}':text='${textoSafe}':fontsize=58:fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=18:x=(w-text_w)/2:y=h-text_h-130`;
+        // Crop + texto via subtitles ASS (drawtext nao disponivel no build do ffmpeg)
+        // libass renderiza com fontes apontadas via fontsdir
+        const assPath = path.join(pasta, 'texto.ass');
+        const textoUp = (texto || 'INSTRUCTIVA').toUpperCase().replace(/[\\{}]/g, '');
+        const assConteudo = `[Script Info]
+ScriptType: v4.00+
+PlayResX: 720
+PlayResY: 1280
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Anton,62,&H00FFFFFF,&H00FFFFFF,&H00000000,&HA0000000,1,0,0,0,100,100,0,0,3,4,1,2,30,30,140,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,9:00:00.00,Default,,0,0,0,,${textoUp}
+`;
+        fs.writeFileSync(assPath, assConteudo);
+        // Escapar : e , no path da subtitles filter pra ffmpeg
+        const assPathEscaped = assPath.replace(/\\/g, '/').replace(/:/g, '\\\\:').replace(/,/g, '\\,');
+        const fontsDir = path.dirname(FONTE);
+        filtroV = `crop=ih*9/16:ih,scale=720:1280,subtitles='${assPathEscaped}':fontsdir='${fontsDir}'`;
       }
       cutArgs = [
         '-y',
