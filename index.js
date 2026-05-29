@@ -770,7 +770,7 @@ app.get('/', requireAuth, (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 68, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 69, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
 });
 
 // ============ ADMIN: atualizar cookies sem mexer no Railway ============
@@ -1450,12 +1450,58 @@ app.post('/preview', requireAuth, async (req, res) => {
             ehTrecho = true;
           }
         } catch (e) { console.log('[cortador-preview] erro:', e.message); }
+
+        // 4) FALLBACK: se trecho falhou, baixa video completo (mais lento mas confiavel)
+        if (!fullPath) {
+          console.log('[cortador-preview] trecho falhou. Fallback: baixando video COMPLETO...');
+          try {
+            const FMT_HQ = 'bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/best';
+            const estrategias = [
+              'youtube:player_client=tv,web_safari',
+              'youtube:player_client=web_safari,default',
+              'youtube:player_client=ios',
+              'youtube:player_client=tv_embedded,android',
+            ];
+            for (const ext of estrategias) {
+              try { if (fs.existsSync(cachedFull)) fs.unlinkSync(cachedFull); } catch (e) {}
+              console.log('[cortador-preview] fallback yt-dlp completo, extractor:', ext);
+              const r = await executar(YTDLP, [
+                '--no-playlist', '--no-warnings', '--no-progress',
+                '--extractor-args', ext,
+                ...(cookiesOk ? ['--cookies', COOKIES_PATH] : []),
+                ...(PROXY_URL ? ['--proxy', PROXY_URL] : []),
+                '--ffmpeg-location', FFMPEG,
+                '-N', '4',
+                '-f', FMT_HQ,
+                '--merge-output-format', 'mp4',
+                '-o', cachedFull,
+                url,
+              ], 'yt-dlp-preview-full');
+              if (r.codigo === 0 && fs.existsSync(cachedFull) && fs.statSync(cachedFull).size > 1024 * 1024) {
+                fullPath = cachedFull;
+                ehTrecho = false; // video completo, vai cortar com -ss real
+                console.log('[cortador-preview] video completo baixado:', (fs.statSync(cachedFull).size/1024/1024).toFixed(1), 'MB');
+                break;
+              }
+            }
+            if (!fullPath && COBALT_API_URL) {
+              console.log('[cortador-preview] yt-dlp completo falhou, tentando Cobalt...');
+              try {
+                await baixarViaCobalt(url, cachedFull);
+                if (fs.existsSync(cachedFull) && fs.statSync(cachedFull).size > 1024 * 1024) {
+                  fullPath = cachedFull;
+                  ehTrecho = false;
+                }
+              } catch (e) { console.log('[cortador-preview] Cobalt falhou:', e.message); }
+            }
+          } catch (e) { console.log('[cortador-preview] erro fallback completo:', e.message); }
+        }
       }
     }
   }
 
   if (!fullPath) {
-    return res.status(404).json({ erro: 'Nao consegui acessar o video pra fazer preview.' });
+    return res.status(404).json({ erro: 'Nao consegui acessar o video pra fazer preview. Tenta upload do arquivo no botao Arquivo.' });
   }
 
   let pasta;
