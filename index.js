@@ -553,7 +553,7 @@ app.get('/', requireAuth, (_req, res) => res.type('html').send(PAGINA));
 app.get('/status', (_req, res) => {
   let videosCacheados = 0;
   try { if (fs.existsSync(CACHE_DIR)) videosCacheados = fs.readdirSync(CACHE_DIR).length; } catch (e) {}
-  res.json({ ok: true, servico: 'cortador', versao: 55, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
+  res.json({ ok: true, servico: 'cortador', versao: 56, cookies: cookiesOk, proxy: PROXY_URL ? (process.env.PROXY_HOST + ':' + process.env.PROXY_PORT) : false, cobalt: COBALT_API_URL || false, videosNoCache: videosCacheados });
 });
 
 // ============ ADMIN: atualizar cookies sem mexer no Railway ============
@@ -961,6 +961,10 @@ app.post('/analisar', requireAuth, upload.single('arquivo'), async (req, res) =>
   let pasta = null;
   const limparUpload = () => { if (arquivoUpload && fs.existsSync(arquivoUpload.path)) { try { fs.unlinkSync(arquivoUpload.path); } catch (e) {} } };
   try {
+    // CRITICO: garantir que yt-dlp e ffmpeg estao baixados/disponiveis
+    if (!arquivoUpload) await garantirYtdlp();
+    await garantirFfmpeg();
+
     pasta = fs.mkdtempSync(path.join(os.tmpdir(), 'cortador-analise-'));
     const videoPath = path.join(pasta, 'video.mp4');
     const audioPath = path.join(pasta, 'audio.mp3');
@@ -987,8 +991,10 @@ app.post('/analisar', requireAuth, upload.single('arquivo'), async (req, res) =>
           'youtube:player_client=tv_embedded,android',
           'youtube:player_client=mweb',
         ];
+        let ultimoErro = '';
         let ok = false;
         for (const ext of estrategias) {
+          console.log('[cortador-analisar] yt-dlp tentando:', ext);
           const r = await executar(YTDLP, [
             '--no-playlist', '--no-warnings', '--no-progress',
             '--extractor-args', ext,
@@ -1003,17 +1009,33 @@ app.post('/analisar', requireAuth, upload.single('arquivo'), async (req, res) =>
           ], 'yt-dlp-analise');
           if (r.codigo === 0 && fs.existsSync(videoPath) && fs.statSync(videoPath).size > 1024 * 1024) {
             ok = true;
+            console.log('[cortador-analisar] yt-dlp OK com', ext);
             break;
           }
+          ultimoErro = (r.stderr || r.stdout || '').slice(-300);
+          console.log('[cortador-analisar] tentativa falhou:', ultimoErro.slice(-200));
           try { if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath); } catch (e) {}
         }
+        let cobaltErro = '';
         if (!ok && COBALT_API_URL) {
-          console.log('[cortador-analisar] yt-dlp falhou, tentando Cobalt');
-          try { await baixarViaCobalt(url, videoPath); } catch (e) {}
+          console.log('[cortador-analisar] yt-dlp falhou em todas, tentando Cobalt...');
+          try {
+            await baixarViaCobalt(url, videoPath);
+            if (fs.existsSync(videoPath) && fs.statSync(videoPath).size > 1024 * 1024) {
+              ok = true;
+              console.log('[cortador-analisar] Cobalt OK');
+            }
+          } catch (e) {
+            cobaltErro = e.message;
+            console.log('[cortador-analisar] Cobalt falhou:', cobaltErro);
+          }
         }
-        if (!fs.existsSync(videoPath) || fs.statSync(videoPath).size <= 1024 * 1024) {
+        if (!ok) {
           limpar(pasta);
-          return res.status(500).json({ erro: 'Nao consegui baixar esse video do YouTube. Tenta com upload de arquivo (botao "Arquivo" acima).' });
+          return res.status(500).json({
+            erro: 'Nao consegui baixar esse video do YouTube. Tenta com upload de arquivo (botao "Arquivo" acima).',
+            detalhe: 'yt-dlp: ' + ultimoErro + '\n\ncobalt: ' + cobaltErro
+          });
         }
         try { fs.copyFileSync(videoPath, cachePath); } catch (e) {}
         fullPath = videoPath;
